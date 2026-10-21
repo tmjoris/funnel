@@ -467,6 +467,7 @@ dependencies = [
  "clap",
  "crossbeam-channel",
  "funnel-sketch",
+ "proptest",
  "serde",
  "serde_json",
  "socket2",

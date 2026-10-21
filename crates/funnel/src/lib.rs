@@ -7,6 +7,7 @@ pub mod router;
 pub mod series;
 pub mod shard;
 pub mod stats;
+pub mod storage;
 pub mod udp;
 
 /// Wall-clock unix seconds; bucket timestamps are wall-clock by definition.
