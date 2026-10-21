@@ -20,16 +20,20 @@ let bytes = s.to_bytes(); // compact varint encoding
 
 For any quantile `q`, the result is within `alpha` relative error of the
 exact value at rank `floor(q * (n - 1))`. Count, sum, min and max are exact,
-and `q = 0` / `q = 1` return the exact min and max. Memory is bounded by
-`max_bins` per sign; when the budget runs out, the lowest bins merge, so high
-quantiles (p99 and up) keep the guarantee and only the lowest ones degrade.
+and `q = 0` / `q = 1` return the exact min and max. Values can carry
+fractional weights through `add_n`, so a StatsD value sampled at `@0.3`
+counts as 3.33 values, and the bound holds for the weighted quantiles too.
+
+Memory is bounded by `max_bins` per sign. When the budget runs out, the
+lowest bins merge, so high quantiles (p99 and up) keep the guarantee and
+only the lowest ones degrade.
 
 These claims are checked with property tests (`tests/properties.rs`,
 512 random cases each): the error bound across 21 decades of positive,
 negative and zero values; merge equals a single sketch over the concatenated
 data, including under tight bin budgets; encoding round-trips; decoding
-arbitrary bytes never panics; and collapsed sketches keep the bound for the
-quantiles near the top.
+arbitrary bytes never panics; collapsed sketches keep the bound for the
+quantiles near the top; and weighted quantiles stay within the bound.
 
 ## The cubic mapping
 
