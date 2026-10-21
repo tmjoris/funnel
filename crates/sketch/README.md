@@ -1,9 +1,12 @@
 # funnel-sketch
 
-A DDSketch implementation in Rust: a mergeable quantile sketch whose answers
-are within a fixed relative error (1% by default) of the exact quantile, no
-matter how skewed the data is. Funnel uses it to store latency distributions
-as roughly 1 KB per series per 10-second bucket instead of every raw value.
+funnel-sketch summarizes a large set of numbers, such as request durations,
+in about a kilobyte. It can then answer questions like "how slow were the
+slowest 1% of requests?" to within 1% of the true answer, however uneven the
+numbers are. Two summaries can be combined into one, which lets Funnel turn
+10-second summaries into hourly or daily ones without keeping raw values.
+It implements DDSketch, a mergeable quantile sketch with a relative-error
+guarantee.
 
 ```rust
 use funnel_sketch::DDSketch;
@@ -22,7 +25,10 @@ For any quantile `q`, the result is within `alpha` relative error of the
 exact value at rank `floor(q * (n - 1))`. Count, sum, min and max are exact,
 and `q = 0` / `q = 1` return the exact min and max. Values can carry
 fractional weights through `add_n`, so a StatsD value sampled at `@0.3`
-counts as 3.33 values, and the bound holds for the weighted quantiles too.
+counts as 3.33 values. Weights are kept as whole numbers of 1/65536ths, like
+cents of a dollar, so 1/0.3 is accurate to about one part in a million and
+every insert is still an integer add. The bound holds for the weighted
+quantiles too.
 
 Memory is bounded by `max_bins` per sign. When the budget runs out, the
 lowest bins merge, so high quantiles (p99 and up) keep the guarantee and
@@ -109,47 +115,51 @@ for each 1M-value dataset is 1.0 to 1.4 KB.
 
 The [Benchmarks workflow](../../.github/workflows/bench.yml) runs on every
 push that touches this crate, on `ubuntu-latest` (x86_64) and
-`ubuntu-24.04-arm` (aarch64), both with 4 vCPUs. All runs below used
-rustc 1.99.1 and the current code, with fractional counts. The x86 label is
-a mixed pool: seven x86 runs of the same commit landed on three different
-AMD EPYC models, so results are grouped by CPU. Repeated runs on the same
-CPU agreed within 1%, except one EPYC 9V74 run, covered below.
+`ubuntu-24.04-arm` (aarch64), both with 4 vCPUs and rustc 1.99.1. The x86
+label is a mixed pool of CPU models, so results are grouped by CPU. The
+table only has CPUs measured with the current code, three runs each;
+repeated runs agreed within 1%.
 
 Insert, 100k lognormal values, in millions of values per second (median):
 
-| CPU | runs | funnel cubic | funnel log | sketches-ddsketch | tdigest batch |
-|---|---|---|---|---|---|
-| Neoverse-N2 | 3 | 195.7 | 123.6 | 89.8 | 52.9 |
-| AMD EPYC 9V45 | 1 | 177.1 | 124.1 | 107.7 | 40.7 |
-| AMD EPYC 9V74 | 1 of 2 | 110.5 | 83.7 | 72.7 | 32.8 |
-| AMD EPYC 7763 | 4 | 77.6 | 60.9 | 38.3 | 28.9 |
+| CPU | funnel cubic | funnel log | sketches-ddsketch | tdigest batch |
+|---|---|---|---|---|
+| Neoverse-N2 | 222.6 | 128.1 | 89.3 | 52.7 |
+| AMD EPYC 7763 | 78.1 | 59.9 | 38.7 | 28.5 |
 
 Merge 10 sketches (median):
 
 | CPU | funnel-sketch | sketches-ddsketch | tdigest |
 |---|---|---|---|
-| Neoverse-N2 | 1.09 µs | 4.07 µs | 22.7 µs |
-| AMD EPYC 9V45 | 0.82 µs | 2.31 µs | 17.2 µs |
-| AMD EPYC 9V74 | 1.32 µs | 3.54 µs | 27.0 µs |
-| AMD EPYC 7763 | 1.21 µs | 3.73 µs | 24.3 µs |
+| Neoverse-N2 | 1.09 µs | 3.82 µs | 22.6 µs |
+| AMD EPYC 7763 | 1.24 µs | 3.75 µs | 24.5 µs |
 
-The cubic mapping has the fastest inserts on every CPU, 1.5 to 2.2 times
-sketches-ddsketch, and merging is 2.7 to 3.7 times faster. Most of the
-insert speedup comes from skipping `ln`: with the log mapping, funnel-sketch
-is only 1.1 to 1.6 times sketches-ddsketch, and an earlier run on an Intel
-Xeon 6973P-C had it slower.
+The cubic mapping inserts 2.0 to 2.5 times as fast as sketches-ddsketch,
+and merging is 3.0 to 3.5 times as fast. Most of the insert speedup comes
+from skipping `ln`: with the log mapping the gain is 1.4 to 1.6 times.
+Earlier versions of the code also ran on an AMD EPYC 9V45, an AMD EPYC
+9V74, an Intel Xeon 6973P-C and an Intel Xeon Platinum 8370C, and the cubic
+mapping had the fastest inserts on each, although on the Xeon 6973P-C the
+log mapping was slower than sketches-ddsketch. One EPYC 9V74 run was about
+30% slower across every benchmark and did not reproduce, which fits a busy
+neighbour on the shared host.
 
-The other EPYC 9V74 run is left out of the table because it did not
-reproduce. Every benchmark in it was about 30% slower than in the second
-run, and the cubic insert was 2.7 times slower (41.2M values/s, below both
-log mappings). A busy neighbour on the shared host fits that pattern; I
-have not been able to check further without access to that CPU.
+## Why counts are integer units
 
-Fractional counts cost some insert speed. On the Neoverse-N2, where runs
-repeat within 0.5%, the cubic insert went from 448 µs to 511 µs (+14%) and
-merging from 1.06 µs to 1.09 to 1.17 µs, while sketches-ddsketch, whose code
-did not change, stayed at 1.10 to 1.11 ms. A float add has several cycles of
-latency against one for an integer add, and latency data keeps landing in
-the same few bins, so consecutive inserts wait on each other. Keeping
-integer bins until the first fractional weight arrives would win this back
-if the sketch ever shows up in a profile of the pipeline.
+Sample rates need fractional weights, and the first fix stored counts as
+`f64`. That was correct and cost 14% of insert speed on the Neoverse-N2: a
+float add takes several cycles, and latency data keeps landing in the same
+few bins, so consecutive inserts wait on each other. Counting in integer
+units of 1/65536 kept the weights and the integer adds. Making every add
+saturate, to guard against overflow, then cost speed again, and much more
+on x86: there is no 64-bit saturating add on several lanes at once there, so
+the merge loop stopped vectorizing. Checking the sketch's total once per
+insert and merge is enough, because no bin can exceed the total.
+
+| Neoverse-N2, 3 runs | `u64` counts, no weights | `f64` counts | saturating units | units, one check |
+|---|---|---|---|---|
+| Insert 100k values | 448 µs | 511 µs | 491 µs | 449 µs |
+| Merge 10 sketches | 1.06 µs | 1.09 µs | 1.06 µs | 1.09 µs |
+
+On the laptop above (Intel i5-6200U), merging 10 sketches took 6.47 µs with
+saturating adds and 1.83 µs with the single check.
