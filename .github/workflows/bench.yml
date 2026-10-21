@@ -23,13 +23,11 @@ jobs:
       - name: Machine
         run: |
           {
-            echo "## ${{ matrix.runner }}"
-            echo '```'
             lscpu | grep -E 'Architecture|Model name|^CPU\(s\)|Thread|MHz'
             free -h | head -2
             rustc --version
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
+          } | tee machine.txt
+          { echo "## ${{ matrix.runner }}"; echo '```'; cat machine.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
       - name: Accuracy
         run: |
           cargo run --release -p funnel-sketch --example accuracy | tee accuracy.txt
@@ -42,6 +40,7 @@ jobs:
         with:
           name: sketch-bench-${{ matrix.runner }}
           path: |
+            machine.txt
             accuracy.txt
             bench.txt
             target/criterion
