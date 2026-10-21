@@ -45,9 +45,9 @@ moves at least `min over t of P'(t)(1 + t)` per unit of `ln x`. That
 minimum is `10/7` (at `t = 0`), so the multiplier becomes
 `1 / (ln(gamma) · 10/7)`, costing about 1% more bins than the log mapping.
 
-The property tests catch the obvious-but-wrong choice: using `1 / ln 2`
-(the slope of the exact `log2`) instead of `10/7` makes proptest find a
-value with 0.1007% error at `alpha = 0.1%`.
+Using `1 / ln 2`, the slope of the exact `log2`, instead of `10/7` breaks
+the bound, and the property tests catch it: proptest finds a value with
+0.1007% error at `alpha = 0.1%`.
 
 ## Results
 
@@ -72,9 +72,8 @@ build. Run them yourself with `cargo bench -p funnel-sketch` and
 | sketches-ddsketch 0.4 | 6.84 µs | 52.5 µs |
 | tdigest 1.0 | 38.9 µs | 769 µs |
 
-Merging adds the overlapping slices of two bin arrays after one resize. An
-earlier version added bin by bin through the insert path and was 3.4×
-slower than sketches-ddsketch.
+Merging resizes the destination once and adds the overlapping slices of the
+two bin arrays.
 
 **Relative error, 1M values** (DDSketch at alpha = 1%, t-digest at
 compression 100)
@@ -94,8 +93,8 @@ compression 100)
 | | sketches-ddsketch | 0.10% | 0.41% | 0.87% | 0.87% |
 | | tdigest | 0.04% | **20.3%** | 0.37% | 2.57% |
 
-t-digest is far more accurate on smooth data and near the median. Its error
-is relative to rank, though, so on heavy tails and gaps between modes it can
-be off by tens of percent, and those tails are what latency alerts watch.
-Both DDSketch implementations stay under 1% everywhere. Encoded, the
-funnel-sketch for each 1M-value dataset is 1.0–1.4 KB.
+t-digest is far more accurate on smooth data and near the median. It bounds
+error in rank, and in a heavy tail or in the gap between two modes a small
+rank error becomes a large value error: 31.9% at p99.9 on the Pareto data. Latency alerts usually fire on exactly those quantiles. Both
+DDSketch implementations stay under 1% everywhere. Encoded, the funnel-sketch
+for each 1M-value dataset is 1.0 to 1.4 KB.
