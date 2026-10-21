@@ -1,7 +1,7 @@
 //! Compact binary form, used when rolled-up distributions go to disk.
 //!
-//! Layout: version, mapping kind, alpha (f64), max_bins, a flags byte, zero
-//! count, sum, min, max, then each store as `len` followed by
+//! Layout: version, mapping kind, alpha (f64), max_bins, sum, min, max, then
+//! the bins: a flags byte, the zero count, and each store as `len` followed by
 //! `(index delta, count)` pairs, all varints. Index deltas are zigzagged;
 //! neighbouring bins have delta 1. Counts are in units of 1/65536 of a value
 //! in memory. When every count is a whole number of values, which is the
@@ -10,9 +10,9 @@
 //! written in units, about four bytes per bin. The total count is not
 //! stored; it is the sum of the bins.
 
-use crate::DDSketch;
 use crate::mapping::{Mapping, MappingKind};
 use crate::store::{Store, UNIT};
+use crate::{Config, DDSketch};
 
 const VERSION: u8 = 3;
 /// Counts are written in units rather than whole values.
@@ -45,18 +45,25 @@ fn whole(c: u64) -> bool {
 
 impl DDSketch {
     pub fn encode(&self, out: &mut Vec<u8>) {
-        let units = !(whole(self.zero)
-            && self.positive.iter().all(|(_, c)| whole(c))
-            && self.negative.iter().all(|(_, c)| whole(c)));
         out.push(VERSION);
         out.push(self.mapping.kind() as u8);
         out.extend_from_slice(&self.mapping.alpha().to_le_bytes());
         put_varint(out, self.positive.max_bins() as u64);
-        out.push(if units { UNIT_COUNTS } else { 0 });
-        put_count(out, self.zero, units);
         for v in [self.sum, self.min, self.max] {
             out.extend_from_slice(&v.to_le_bytes());
         }
+        self.encode_bins(out);
+    }
+
+    /// Writes only the bins and the zero count, for formats that store the
+    /// configuration once and sum, min and max in columns of their own.
+    /// Read back with [`DDSketch::decode_bins`].
+    pub fn encode_bins(&self, out: &mut Vec<u8>) {
+        let units = !(whole(self.zero)
+            && self.positive.iter().all(|(_, c)| whole(c))
+            && self.negative.iter().all(|(_, c)| whole(c)));
+        out.push(if units { UNIT_COUNTS } else { 0 });
+        put_count(out, self.zero, units);
         encode_store(&self.positive, units, out);
         encode_store(&self.negative, units, out);
     }
@@ -74,33 +81,53 @@ impl DDSketch {
         if version != VERSION {
             return Err(DecodeError::Version(version));
         }
-        let kind = match r.byte()? {
+        let mapping = match r.byte()? {
             0 => MappingKind::Logarithmic,
             1 => MappingKind::Cubic,
             m => return Err(DecodeError::Mapping(m)),
         };
         let alpha = r.f64()?;
-        if !(alpha > 0.0 && alpha < 1.0) {
-            return Err(DecodeError::Invalid);
-        }
         let max_bins = r.varint()?;
-        if max_bins == 0 || max_bins > u32::MAX as u64 {
+        if max_bins > u32::MAX as u64 {
             return Err(DecodeError::Invalid);
         }
+        let config = Config {
+            alpha,
+            mapping,
+            max_bins: max_bins as u32,
+        };
+        let (sum, min, max) = (r.f64()?, r.f64()?, r.f64()?);
+        let (sketch, used) = Self::decode_bins(config, sum, min, max, &buf[r.pos..])?;
+        Ok((sketch, r.pos + used))
+    }
+
+    /// Reads what [`DDSketch::encode_bins`] wrote, given the configuration
+    /// and the sum, min and max stored elsewhere. Returns the sketch and the
+    /// number of bytes consumed.
+    pub fn decode_bins(
+        config: Config,
+        sum: f64,
+        min: f64,
+        max: f64,
+        buf: &[u8],
+    ) -> Result<(DDSketch, usize), DecodeError> {
+        if !(config.alpha > 0.0 && config.alpha < 1.0) || config.max_bins == 0 {
+            return Err(DecodeError::Invalid);
+        }
+        let mut r = Reader { buf, pos: 0 };
         let units = match r.byte()? {
             0 => false,
             UNIT_COUNTS => true,
             _ => return Err(DecodeError::Invalid),
         };
         let zero = r.count(units, true)?;
-        let (sum, min, max) = (r.f64()?, r.f64()?, r.f64()?);
         // Bins use plain adds, so the decoder bounds the running total itself.
         let mut total = zero;
-        let positive = decode_store(&mut r, max_bins as u32, units, &mut total)?;
-        let negative = decode_store(&mut r, max_bins as u32, units, &mut total)?;
+        let positive = decode_store(&mut r, config.max_bins, units, &mut total)?;
+        let negative = decode_store(&mut r, config.max_bins, units, &mut total)?;
         let count = total;
         let sketch = DDSketch {
-            mapping: Mapping::new(kind, alpha),
+            mapping: Mapping::new(config.mapping, config.alpha),
             positive,
             negative,
             zero,
@@ -235,6 +262,25 @@ mod tests {
         assert_eq!(used, bytes.len());
         assert_eq!(d.to_bytes(), bytes);
         assert_eq!(d.quantile(0.5), s.quantile(0.5));
+    }
+
+    #[test]
+    fn bins_only_roundtrip() {
+        let mut s = DDSketch::default();
+        for x in [-2.0, 0.0, 3.5, 3.5, 1e4] {
+            s.add_n(x, 1.0 / 0.3);
+        }
+        let mut bins = Vec::new();
+        s.encode_bins(&mut bins);
+        let (sum, min, max) = (s.sum(), s.min().unwrap(), s.max().unwrap());
+        let (d, used) = DDSketch::decode_bins(s.config(), sum, min, max, &bins).unwrap();
+        assert_eq!(used, bins.len());
+        assert_eq!(d.to_bytes(), s.to_bytes());
+        let bad = Config {
+            alpha: 0.0,
+            ..s.config()
+        };
+        assert!(DDSketch::decode_bins(bad, sum, min, max, &bins).is_err());
     }
 
     #[test]
