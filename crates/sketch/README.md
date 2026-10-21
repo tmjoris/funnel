@@ -109,30 +109,47 @@ for each 1M-value dataset is 1.0 to 1.4 KB.
 
 The [Benchmarks workflow](../../.github/workflows/bench.yml) runs on every
 push that touches this crate, on `ubuntu-latest` (x86_64) and
-`ubuntu-24.04-arm` (aarch64). Both have 4 vCPUs, and the runs below used
-rustc 1.99.1. The x86 label is a mixed pool: three runs of the same commit
-landed once on an Intel Xeon 6973P-C and twice on an AMD EPYC 9V45, so the
-results are grouped by CPU. The three Neoverse-N2 runs agreed within 1%, the
-two EPYC runs within about 4%.
+`ubuntu-24.04-arm` (aarch64), both with 4 vCPUs. All runs below used
+rustc 1.99.1 and the current code, with fractional counts. The x86 label is
+a mixed pool: seven x86 runs of the same commit landed on three different
+AMD EPYC models, so results are grouped by CPU. Repeated runs on the same
+CPU agreed within 1%, except one EPYC 9V74 run, covered below.
 
 Insert, 100k lognormal values, in millions of values per second (median):
 
-| CPU | funnel cubic | funnel log | sketches-ddsketch | tdigest batch |
-|---|---|---|---|---|
-| Neoverse-N2, 3 runs | 223.0 | 127.1 | 90.8 | 52.8 |
-| AMD EPYC 9V45, 2 runs | 197.2 | 133.9 | 117.5 | 43.6 |
-| Intel Xeon 6973P-C, 1 run | 172.8 | 98.7 | 115.9 | 41.8 |
+| CPU | runs | funnel cubic | funnel log | sketches-ddsketch | tdigest batch |
+|---|---|---|---|---|---|
+| Neoverse-N2 | 3 | 195.7 | 123.6 | 89.8 | 52.9 |
+| AMD EPYC 9V45 | 1 | 177.1 | 124.1 | 107.7 | 40.7 |
+| AMD EPYC 9V74 | 1 of 2 | 110.5 | 83.7 | 72.7 | 32.8 |
+| AMD EPYC 7763 | 4 | 77.6 | 60.9 | 38.3 | 28.9 |
 
 Merge 10 sketches (median):
 
 | CPU | funnel-sketch | sketches-ddsketch | tdigest |
 |---|---|---|---|
-| Neoverse-N2 | 1.06 µs | 3.82 µs | 22.6 µs |
-| AMD EPYC 9V45 | 0.76 µs | 2.15 µs | 15.8 µs |
-| Intel Xeon 6973P-C | 0.75 µs | 2.67 µs | 20.3 µs |
+| Neoverse-N2 | 1.09 µs | 4.07 µs | 22.7 µs |
+| AMD EPYC 9V45 | 0.82 µs | 2.31 µs | 17.2 µs |
+| AMD EPYC 9V74 | 1.32 µs | 3.54 µs | 27.0 µs |
+| AMD EPYC 7763 | 1.21 µs | 3.73 µs | 24.3 µs |
 
-The cubic mapping has the fastest inserts on all three CPUs, 1.5 to 2.5
-times sketches-ddsketch. With the log mapping, funnel-sketch is slower than
-sketches-ddsketch on the Xeon, so most of the insert speedup comes from
-skipping `ln`; the bin store by itself is not faster on every CPU. Merging is
-2.8 to 3.6 times faster than sketches-ddsketch everywhere.
+The cubic mapping has the fastest inserts on every CPU, 1.5 to 2.2 times
+sketches-ddsketch, and merging is 2.7 to 3.7 times faster. Most of the
+insert speedup comes from skipping `ln`: with the log mapping, funnel-sketch
+is only 1.1 to 1.6 times sketches-ddsketch, and an earlier run on an Intel
+Xeon 6973P-C had it slower.
+
+The other EPYC 9V74 run is left out of the table because it did not
+reproduce. Every benchmark in it was about 30% slower than in the second
+run, and the cubic insert was 2.7 times slower (41.2M values/s, below both
+log mappings). A busy neighbour on the shared host fits that pattern; I
+have not been able to check further without access to that CPU.
+
+Fractional counts cost some insert speed. On the Neoverse-N2, where runs
+repeat within 0.5%, the cubic insert went from 448 µs to 511 µs (+14%) and
+merging from 1.06 µs to 1.09 to 1.17 µs, while sketches-ddsketch, whose code
+did not change, stayed at 1.10 to 1.11 ms. A float add has several cycles of
+latency against one for an integer add, and latency data keeps landing in
+the same few bins, so consecutive inserts wait on each other. Keeping
+integer bins until the first fractional weight arrives would win this back
+if the sketch ever shows up in a profile of the pipeline.
