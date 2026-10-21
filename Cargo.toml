@@ -1,0 +1,10 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+
+[profile.release]
+debug = 1
