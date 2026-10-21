@@ -15,13 +15,22 @@
 //!
 //! Columns per kind: counters store one XOR-compressed float column; gauges
 //! store min, max, last and sum as float columns plus count and the offset
-//! of `last_at` from the bucket start as varints; distributions store their
-//! encoded sketches back to back.
+//! of `last_at` from the bucket start as varints. Distributions store the
+//! sketch configuration once per series, then for each bucket its sum, min
+//! and max as plain floats followed by its bins; a series whose sketches use
+//! different configurations falls back to full encoded sketches.
+//!
+//! Blocks are meant to be zstd-compressed as a whole, so layouts were chosen
+//! by size after zstd. Keeping each bucket's statistics next to its bins
+//! compressed 16% better than separate sum/min/max columns, whether those
+//! columns used Gorilla's XOR encoding or byte stream split. Our best guess
+//! is that a bucket's min and its first bin index carry nearly the same
+//! information, and side by side they form byte patterns zstd can match.
 
 use std::collections::BTreeMap;
 use std::fmt;
 
-use funnel_sketch::DDSketch;
+use funnel_sketch::{Config as SketchConfig, DDSketch, MappingKind};
 
 use super::gorilla::{decode_floats, decode_times, encode_floats, encode_times};
 use crate::aggregator::{Bucket, Gauge, Value};
@@ -165,15 +174,41 @@ fn encode_series(series: &[&Bucket], out: &mut Vec<u8>) {
             }
         }
         Kind::Distribution => {
-            for b in series {
-                let Value::Distribution(s) = &b.value else {
-                    unreachable!("one kind per series")
-                };
-                s.encode(out);
+            let sketches: Vec<&DDSketch> = series
+                .iter()
+                .map(|b| match &b.value {
+                    Value::Distribution(s) => &**s,
+                    _ => unreachable!("one kind per series"),
+                })
+                .collect();
+            let config = sketches[0].config();
+            let shared = sketches.iter().all(|s| {
+                let c = s.config();
+                (c.alpha, c.mapping, c.max_bins) == (config.alpha, config.mapping, config.max_bins)
+            });
+            if !shared {
+                out.push(FULL_SKETCHES);
+                sketches.iter().for_each(|s| s.encode(out));
+                return;
+            }
+            out.push(SHARED_CONFIG);
+            out.push(config.mapping as u8);
+            out.extend_from_slice(&config.alpha.to_le_bytes());
+            put_varint(out, config.max_bins as u64);
+            // Empty sketches have no min or max; store 0 and restore them as
+            // empty from the bins.
+            for s in &sketches {
+                for v in [s.sum(), s.min().unwrap_or(0.0), s.max().unwrap_or(0.0)] {
+                    out.extend_from_slice(&v.to_le_bytes());
+                }
+                s.encode_bins(out);
             }
         }
     }
 }
+
+const SHARED_CONFIG: u8 = 0;
+const FULL_SKETCHES: u8 = 1;
 
 /// A decoded block's tenant and index; series data is decoded on demand.
 pub struct Reader<'a> {
@@ -235,6 +270,11 @@ impl<'a> Reader<'a> {
         })
     }
 
+    /// Bytes of data stored for one series.
+    pub fn series_len(&self, entry: &IndexEntry) -> usize {
+        entry.len
+    }
+
     /// Index entries for one metric name.
     pub fn find(&self, name: &str) -> &[IndexEntry] {
         let lo = self.index.partition_point(|e| e.name.as_str() < name);
@@ -280,11 +320,42 @@ impl<'a> Reader<'a> {
             }
             Kind::Distribution => {
                 let mut out = Vec::with_capacity(n);
-                for _ in 0..n {
-                    let (sketch, used) =
-                        DDSketch::decode(&data[c.pos..]).map_err(|_| BlockError::Corrupt)?;
-                    c.pos += used;
-                    out.push(Value::Distribution(Box::new(sketch)));
+                match c.byte()? {
+                    FULL_SKETCHES => {
+                        for _ in 0..n {
+                            let (sketch, used) = DDSketch::decode(&data[c.pos..])
+                                .map_err(|_| BlockError::Corrupt)?;
+                            c.pos += used;
+                            out.push(Value::Distribution(Box::new(sketch)));
+                        }
+                    }
+                    SHARED_CONFIG => {
+                        let mapping = match c.byte()? {
+                            0 => MappingKind::Logarithmic,
+                            1 => MappingKind::Cubic,
+                            _ => return Err(BlockError::Corrupt),
+                        };
+                        let alpha = f64::from_le_bytes(c.take(8)?.try_into().unwrap());
+                        let max_bins =
+                            u32::try_from(c.varint()?).map_err(|_| BlockError::Corrupt)?;
+                        let config = SketchConfig {
+                            alpha,
+                            mapping,
+                            max_bins,
+                        };
+                        for _ in 0..n {
+                            let mut stat = || -> Result<f64, BlockError> {
+                                Ok(f64::from_le_bytes(c.take(8)?.try_into().unwrap()))
+                            };
+                            let (sum, min, max) = (stat()?, stat()?, stat()?);
+                            let (sketch, used) =
+                                DDSketch::decode_bins(config, sum, min, max, &data[c.pos..])
+                                    .map_err(|_| BlockError::Corrupt)?;
+                            c.pos += used;
+                            out.push(Value::Distribution(Box::new(sketch)));
+                        }
+                    }
+                    _ => return Err(BlockError::Corrupt),
                 }
                 out
             }
@@ -355,6 +426,13 @@ impl<'a> Cursor<'a> {
         Err(BlockError::Corrupt)
     }
 
+    fn take(&mut self, len: usize) -> Result<&'a [u8], BlockError> {
+        let end = self.pos.checked_add(len).ok_or(BlockError::Corrupt)?;
+        let out = self.buf.get(self.pos..end).ok_or(BlockError::Corrupt)?;
+        self.pos = end;
+        Ok(out)
+    }
+
     fn bytes(&mut self) -> Result<&'a [u8], BlockError> {
         let len = self.varint()? as usize;
         let end = self.pos.checked_add(len).ok_or(BlockError::Corrupt)?;
@@ -371,6 +449,8 @@ impl<'a> Cursor<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+
     use crate::aggregator::{Aggregator, Config};
     use crate::protocol::parse_line;
     use proptest::prelude::*;
@@ -461,6 +541,43 @@ mod tests {
         merged.merge(&decoded[1].1).unwrap();
         let Value::Gauge(g) = merged else { panic!() };
         assert_eq!((g.last, g.last_at, g.count), (3.0, 107, 3));
+    }
+
+    #[test]
+    fn mixed_sketch_configs_fall_back_to_full_sketches() {
+        let key = Arc::new(crate::series::SeriesKey {
+            tenant: "acme".into(),
+            name: "lat".into(),
+            kind: Kind::Distribution,
+            tags: vec![],
+        });
+        let sketch = |alpha: f64, x: f64| {
+            let mut s = DDSketch::new(SketchConfig {
+                alpha,
+                ..SketchConfig::default()
+            });
+            s.add(x);
+            Value::Distribution(Box::new(s))
+        };
+        let input = vec![
+            Bucket {
+                start: 100,
+                series: key.clone(),
+                value: sketch(0.01, 5.0),
+            },
+            Bucket {
+                start: 110,
+                series: key,
+                value: sketch(0.02, 7.0),
+            },
+        ];
+        let bytes = encode("acme", &input);
+        let r = Reader::open(&bytes).unwrap();
+        let decoded = r.series(&r.index[0]).unwrap();
+        for (b, (start, v)) in input.iter().zip(&decoded) {
+            assert_eq!(b.start, *start);
+            assert!(same(&b.value, v));
+        }
     }
 
     #[test]
