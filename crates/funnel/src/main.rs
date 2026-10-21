@@ -27,8 +27,9 @@ struct Args {
     queue: usize,
     #[arg(long, env = "FUNNEL_MAX_SERIES", default_value_t = 10_000)]
     max_series_per_tenant: usize,
-    #[arg(long, env = "FUNNEL_MAX_BUCKETS", default_value_t = 2_000_000)]
-    max_buckets: usize,
+    /// Memory for open buckets, split evenly across shards.
+    #[arg(long, env = "FUNNEL_MAX_MEMORY_MB", default_value_t = 256)]
+    max_memory_mb: usize,
     #[arg(long, env = "FUNNEL_TENANT", default_value = "default")]
     default_tenant: String,
 }
@@ -50,11 +51,11 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()));
 
     let stats = Arc::new(Stats::default());
-    let reports: shard::Reports = Arc::new(Mutex::new(vec![Vec::new(); shards]));
+    let reports: shard::Reports = Arc::new(Mutex::new(vec![Default::default(); shards]));
     let (bucket_tx, bucket_rx) = crossbeam_channel::bounded::<Vec<Bucket>>(64);
     let config = shard::Config {
         aggregator: aggregator::Config {
-            max_buckets: args.max_buckets.div_ceil(shards),
+            max_bytes: (args.max_memory_mb << 20) / shards,
             ..aggregator::Config::default()
         },
         limiter: limiter::Config {

@@ -60,13 +60,21 @@ async fn ingest(State(state): State<AppState>, headers: HeaderMap, body: String)
 #[derive(Serialize)]
 struct StatsResponse {
     counters: Snapshot,
+    open_buckets: usize,
+    memory_bytes: usize,
     tenants: Vec<TenantReport>,
 }
 
 /// Shards see disjoint series, so per-tenant numbers add up across shards.
 async fn stats(State(state): State<AppState>) -> Json<StatsResponse> {
     let mut tenants: BTreeMap<String, TenantReport> = BTreeMap::new();
-    for report in state.reports.lock().unwrap().iter().flatten() {
+    let (mut open_buckets, mut memory_bytes) = (0, 0);
+    let reports = state.reports.lock().unwrap();
+    for shard in reports.iter() {
+        open_buckets += shard.open_buckets;
+        memory_bytes += shard.memory_bytes;
+    }
+    for report in reports.iter().flat_map(|s| &s.tenants) {
         let t = tenants
             .entry(report.tenant.clone())
             .or_insert_with(|| TenantReport {
@@ -81,6 +89,8 @@ async fn stats(State(state): State<AppState>) -> Json<StatsResponse> {
     }
     Json(StatsResponse {
         counters: state.router.stats().snapshot(),
+        open_buckets,
+        memory_bytes,
         tenants: tenants.into_values().collect(),
     })
 }

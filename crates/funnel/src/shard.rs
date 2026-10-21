@@ -34,8 +34,24 @@ pub struct Shard {
     pub handle: JoinHandle<()>,
 }
 
-/// Latest limiter report from each shard, for `/stats`.
-pub type Reports = Arc<Mutex<Vec<Vec<TenantReport>>>>;
+/// What a shard last reported, for `/stats`.
+#[derive(Clone, Debug, Default)]
+pub struct ShardReport {
+    pub tenants: Vec<TenantReport>,
+    pub open_buckets: usize,
+    pub memory_bytes: usize,
+}
+
+/// Latest report from each shard, indexed by shard.
+pub type Reports = Arc<Mutex<Vec<ShardReport>>>;
+
+fn report(agg: &Aggregator, limiter: &Limiter) -> ShardReport {
+    ShardReport {
+        tenants: limiter.report(),
+        open_buckets: agg.open_buckets(),
+        memory_bytes: agg.memory_bytes(),
+    }
+}
 
 pub fn spawn(
     index: usize,
@@ -78,14 +94,14 @@ fn run(
         if Instant::now() >= next_flush {
             next_flush += config.flush_every;
             let buckets = agg.flush(unix_now());
-            reports.lock().unwrap()[index] = limiter.report();
+            reports.lock().unwrap()[index] = report(&agg, &limiter);
             if !buckets.is_empty() && out.send(buckets).is_err() {
                 return;
             }
         }
     }
     let _ = out.send(agg.flush_all());
-    reports.lock().unwrap()[index] = limiter.report();
+    reports.lock().unwrap()[index] = report(&agg, &limiter);
 }
 
 fn process(batch: &Batch, agg: &mut Aggregator, limiter: &mut Limiter, stats: &Stats) {

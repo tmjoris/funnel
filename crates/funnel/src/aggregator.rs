@@ -9,6 +9,13 @@
 //! more than one flushed bucket, and readers combine them with
 //! [`Value::merge`]. Every aggregate here merges exactly, which is what
 //! makes accepting late data cheap.
+//!
+//! Memory is bounded in bytes, not bucket count, because a counter bucket
+//! is tens of bytes and a distribution can grow to tens of kilobytes. The
+//! estimate covers each bucket (map entry plus the sketch's allocation) and
+//! each series key; like Relay's, it ignores allocator slack. Past
+//! `max_bytes` new buckets are refused, while existing sketches may still
+//! grow, by at most their `max_bins` limit each.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -26,8 +33,9 @@ pub struct Config {
     pub max_past_secs: u64,
     /// Points stamped further than this into the future are rejected.
     pub max_future_secs: u64,
-    /// Open buckets across all windows; new buckets past this are rejected.
-    pub max_buckets: usize,
+    /// Estimated bytes of open buckets and series keys; new buckets past
+    /// this are rejected.
+    pub max_bytes: usize,
     pub sketch: funnel_sketch::Config,
 }
 
@@ -38,7 +46,7 @@ impl Default for Config {
             grace_secs: 5,
             max_past_secs: 24 * 3600,
             max_future_secs: 60,
-            max_buckets: 1_000_000,
+            max_bytes: 256 << 20,
             sketch: funnel_sketch::Config::default(),
         }
     }
@@ -140,7 +148,7 @@ pub enum Reject {
     TooOld,
     /// The timestamp is too far ahead of the receive time.
     Future,
-    /// `max_buckets` is reached and the point needs a new bucket.
+    /// `max_bytes` is reached and the point needs a new bucket.
     Overflow,
 }
 
@@ -160,6 +168,37 @@ pub struct Aggregator {
     windows: BTreeMap<u64, Window>,
     series: IdMap<SeriesEntry>,
     buckets: usize,
+    bytes: usize,
+}
+
+/// Map entry for one bucket: key, value and hashbrown's control byte, at
+/// its maximum load factor of 7/8.
+const BUCKET_ENTRY: usize =
+    (std::mem::size_of::<SeriesId>() + std::mem::size_of::<Value>() + 1) * 8 / 7;
+/// Map entry for one series, the key struct and the `Arc` counts.
+const SERIES_ENTRY: usize =
+    (std::mem::size_of::<SeriesId>() + std::mem::size_of::<SeriesEntry>() + 1) * 8 / 7
+        + std::mem::size_of::<SeriesKey>()
+        + 16;
+
+fn bucket_bytes(value: &Value) -> usize {
+    BUCKET_ENTRY
+        + match value {
+            Value::Distribution(s) => s.memory_bytes(),
+            _ => 0,
+        }
+}
+
+fn series_bytes(key: &SeriesKey) -> usize {
+    SERIES_ENTRY
+        + key.tenant.len()
+        + key.name.len()
+        + key.tags.capacity() * std::mem::size_of::<(String, String)>()
+        + key
+            .tags
+            .iter()
+            .map(|(k, v)| k.len() + v.len())
+            .sum::<usize>()
 }
 
 impl Aggregator {
@@ -170,7 +209,13 @@ impl Aggregator {
             windows: BTreeMap::new(),
             series: IdMap::default(),
             buckets: 0,
+            bytes: 0,
         }
+    }
+
+    /// Estimated bytes held by open buckets and their series keys.
+    pub fn memory_bytes(&self) -> usize {
+        self.bytes
     }
 
     pub fn open_buckets(&self) -> usize {
@@ -235,23 +280,32 @@ impl Aggregator {
             buckets: IdMap::default(),
         });
         match window.buckets.get_mut(&id) {
-            Some(value) => add_line(value, line, ts),
+            Some(value) => {
+                let before = bucket_bytes(value);
+                add_line(value, line, ts);
+                self.bytes = self.bytes + bucket_bytes(value) - before;
+            }
             None => {
-                if self.buckets >= self.config.max_buckets {
+                if self.bytes >= self.config.max_bytes {
                     if window.buckets.is_empty() {
                         self.windows.remove(&start);
                     }
                     return Err(Reject::Overflow);
                 }
-                window
-                    .buckets
-                    .insert(id, new_value(line, ts, &self.config.sketch));
+                let value = new_value(line, ts, &self.config.sketch);
+                self.bytes += bucket_bytes(&value);
+                window.buckets.insert(id, value);
                 self.buckets += 1;
+                let bytes = &mut self.bytes;
                 self.series
                     .entry(id)
-                    .or_insert_with(|| SeriesEntry {
-                        key: Arc::new(SeriesKey::new(tenant, line)),
-                        windows: 0,
+                    .or_insert_with(|| {
+                        let key = SeriesKey::new(tenant, line);
+                        *bytes += series_bytes(&key);
+                        SeriesEntry {
+                            key: Arc::new(key),
+                            windows: 0,
+                        }
                     })
                     .windows += 1;
             }
@@ -286,8 +340,10 @@ impl Aggregator {
                 let key = series.key.clone();
                 series.windows -= 1;
                 if series.windows == 0 {
+                    self.bytes -= series_bytes(&key);
                     self.series.remove(&id);
                 }
+                self.bytes -= bucket_bytes(&value);
                 out.push(Bucket {
                     start,
                     series: key,
@@ -487,9 +543,12 @@ mod tests {
     }
 
     #[test]
-    fn overflow_caps_buckets_but_updates_existing() {
+    fn memory_bound_refuses_new_buckets_but_updates_existing() {
+        let mut probe = agg();
+        put(&mut probe, 100, "a:1|c").unwrap();
+        let one = probe.memory_bytes();
         let mut a = Aggregator::new(Config {
-            max_buckets: 2,
+            max_bytes: one * 2,
             ..Config::default()
         });
         put(&mut a, 100, "a:1|c").unwrap();
@@ -498,7 +557,27 @@ mod tests {
         assert_eq!(put(&mut a, 120, "a:1|c"), Err(Reject::Overflow));
         assert!(put(&mut a, 100, "a:5|c").is_ok());
         assert_eq!(a.flush_all().len(), 2);
+        assert_eq!(a.memory_bytes(), 0);
         assert!(put(&mut a, 120, "c:1|c").is_ok());
+    }
+
+    #[test]
+    fn memory_tracks_sketch_growth_and_returns_to_zero() {
+        let mut a = agg();
+        put(&mut a, 100, "lat:1|d|#route:/a").unwrap();
+        let small = a.memory_bytes();
+        for i in 0..2000 {
+            put(&mut a, 100, &format!("lat:{}|d|#route:/a", 1.01f64.powi(i))).unwrap();
+        }
+        assert!(
+            a.memory_bytes() > small + 2000,
+            "{} vs {small}",
+            a.memory_bytes()
+        );
+        put(&mut a, 110, "lat:1|d|#route:/a").unwrap();
+        a.flush_all();
+        assert_eq!(a.memory_bytes(), 0);
+        assert_eq!(a.open_series(), 0);
     }
 
     #[test]
