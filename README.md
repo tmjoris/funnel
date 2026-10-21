@@ -85,9 +85,66 @@ series to new ones at the boundary.
 dropped for overload, or rejected for being too old, too far in the future,
 over the memory bound or over the series limit.
 
-Still to come: compressed storage (Gorilla-style encoding, Parquet and plain
-zstd, benchmarked against each other), a small query API, a load generator
-and the cost write-up.
+A writer thread collects flushed buckets per tenant and, once a minute,
+writes one zstd-compressed block file per tenant, named by its time range
+so queries can skip files without opening them. Files are written under a
+temporary name, synced and renamed, so a crash leaves whole files only.
+
+`GET /query` reads one metric over a time range, with optional tag filters,
+grouping and a step, and returns one number per point:
+
+```sh
+# p99 latency of /checkout per host, in 1-minute points, over the last hour
+curl 'localhost:8080/query?metric=http.duration&where=route:/checkout&group_by=host&step=60&agg=p99'
+```
+
+Every combination happens through the same merge: partial buckets of one
+window, several hosts grouped into one line and six 10-second buckets folded
+into a minute. Merging sketches is what makes a grouped p99 correct; an
+average of per-host p99s is not the p99 of all requests.
+
+## Storage: what each format costs
+
+A [benchmark](crates/funnel/examples/storage.rs) generates 10 minutes of a
+simulated backend with the [workload generator](crates/loadgen): 20 services
+on 5 hosts each, 13.6 million points across 7,000 series. It stores the same
+data in each format and reports bytes per raw point received. Measured on
+an Intel i5-6200U laptop, zstd level 3:
+
+| format | bytes per point | vs raw columns | encode | decode |
+|---|---|---|---|---|
+| raw StatsD text + zstd | 5.14 | 2.0x larger | | |
+| raw columns + zstd (series, time, value, sorted) | 2.61 | 1.0x | 2.6 s | |
+| 10 s rollups, one row per bucket + zstd | 0.76 | 3.4x smaller | 0.9 s | |
+| 10 s rollups, Gorilla block, no zstd | 1.21 | 2.2x smaller | 0.9 s | 0.3 s |
+| **10 s rollups, Gorilla block + zstd** | **0.48** | **5.4x smaller** | 1.1 s | 0.4 s |
+| 10 s rollups, Parquet with zstd | 0.51 | 5.1x smaller | 1.5 s | 0.06 s * |
+
+\* Parquet's decode stops at Arrow arrays and leaves sketches as bytes; the
+Gorilla decode includes turning every sketch back into a sketch.
+
+The 331k buckets replace 13.6 million points, 41 points per bucket, yet the
+saving over a column store is 5.4x rather than 41x. Raw columns compress
+very well where values repeat: a counter that is always `1` costs almost
+nothing. What they cannot compress is the random part, latency values, and
+that is the part the sketches replace. Distributions are 94% of the block
+before compression: counters cost about 2 bytes per bucket, gauges 16 and
+distribution sketches 93.
+
+Two layout choices were made by measurement, after zstd, since blocks are
+always stored compressed:
+
+- Each series stores its sketch settings once instead of in every bucket.
+- Each bucket's sum, min and max sit right next to its sketch bins. Moving
+  them into separate columns, which is the textbook columnar choice, made
+  the compressed file 16% larger, whether those columns used Gorilla's XOR
+  encoding or Parquet's byte stream split. The likely reason is that a
+  bucket's min and its first bin describe nearly the same number, and side
+  by side they form byte patterns zstd can match.
+
+Gorilla's XOR encoding works very well on counters and gauges, whose
+consecutive values are similar, and saves little on latency statistics,
+which jump around from bucket to bucket.
 
 ## Known limits
 
@@ -101,13 +158,21 @@ and the cost write-up.
   queue and cause drops for others.
 - The series limit costs about 10 bytes per admitted series per tenant:
   fine for tens of tenants, too much for tens of thousands.
+- Queries read only what is on disk, so the newest minute or so (one writer
+  segment plus the flush delay) is not visible yet.
+- A crash loses the rollups waiting for the next block write, up to one
+  segment (60 seconds by default).
+- Block files are never merged, so a long time range opens many one-minute
+  files and repeats the series index in each. Compacting them into hourly
+  blocks is the obvious next step.
 
 ## Status
 
 | crate | state |
 |---|---|
 | [`crates/sketch`](crates/sketch) | Done. DDSketch with property-tested error bounds; faster inserts and merges than `sketches-ddsketch` and under 1% error where t-digest reaches 32% |
-| `crates/funnel` | In progress. Ingest, rollups, late data, the memory bound and series limits work; storage, query, load testing and the write-up are next |
+| `crates/funnel` | Ingest, rollups, late data, memory bound, series limits, block storage and queries work. Load testing, the ClickHouse comparison and the cost write-up are next |
+| [`crates/loadgen`](crates/loadgen) | Deterministic StatsD workload shaped like a small SaaS backend |
 
 ## Building and testing
 
@@ -115,6 +180,9 @@ and the cost write-up.
 cargo test --workspace
 cargo bench -p funnel-sketch
 cargo run --release -p funnel-sketch --example accuracy
+cargo run --release -p funnel --example storage -- 10   # minutes of workload
+
+cargo run --release -p funnel -- --data-dir data   # UDP :8125, HTTP :8080
 ```
 
 ## License
