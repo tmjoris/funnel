@@ -18,6 +18,7 @@ tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "net", "s
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
+zstd = "0.13"
 
 [dev-dependencies]
 arrow-array = "60"

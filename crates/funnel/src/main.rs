@@ -8,6 +8,7 @@ use funnel::aggregator::Bucket;
 use funnel::http::{self, AppState};
 use funnel::router::Router;
 use funnel::stats::Stats;
+use funnel::storage::writer;
 use funnel::{aggregator, limiter, shard, udp};
 
 #[derive(Parser, Debug)]
@@ -32,6 +33,13 @@ struct Args {
     max_memory_mb: usize,
     #[arg(long, env = "FUNNEL_TENANT", default_value = "default")]
     default_tenant: String,
+    /// Directory for block files, one subdirectory per tenant.
+    #[arg(long, env = "FUNNEL_DATA_DIR", default_value = "data")]
+    data_dir: std::path::PathBuf,
+    /// Seconds of rollups held in memory before they are written; a crash
+    /// loses at most this much.
+    #[arg(long, env = "FUNNEL_SEGMENT_SECS", default_value_t = 60)]
+    segment_secs: u64,
 }
 
 #[tokio::main]
@@ -80,13 +88,15 @@ async fn main() -> anyhow::Result<()> {
         .collect();
     drop(bucket_tx);
 
-    // Storage comes next; for now flushed buckets are only counted.
-    let sink_stats = stats.clone();
-    let sink = std::thread::spawn(move || {
-        for buckets in bucket_rx {
-            Stats::add(&sink_stats.buckets_flushed, buckets.len() as u64);
-        }
-    });
+    let writer = writer::spawn(
+        writer::Config {
+            dir: args.data_dir.clone(),
+            segment: Duration::from_secs(args.segment_secs),
+            ..writer::Config::default()
+        },
+        bucket_rx,
+        stats.clone(),
+    );
 
     let router = Arc::new(Router::new(
         shards.iter().map(|s| s.batches.clone()).collect(),
@@ -127,7 +137,7 @@ async fn main() -> anyhow::Result<()> {
         drop(s.batches);
         let _ = s.handle.join();
     }
-    let _ = sink.join();
+    let _ = writer.join();
     tracing::info!(stats = ?stats.snapshot(), "stopped");
     Ok(())
 }

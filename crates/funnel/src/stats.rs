@@ -39,6 +39,9 @@ counters!(
     rejected_overflow,
     lines_accepted,
     buckets_flushed,
+    blocks_written,
+    bytes_written,
+    buckets_lost_write,
 );
 
 impl Stats {
