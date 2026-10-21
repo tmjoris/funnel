@@ -89,7 +89,7 @@ impl DDSketch {
     /// `false`.
     #[inline]
     pub fn add_n(&mut self, x: f64, n: f64) -> bool {
-        if !x.is_finite() || !(n > 0.0 && n.is_finite()) {
+        if !x.is_finite() || n <= 0.0 || !n.is_finite() {
             return false;
         }
         if x >= MIN_INDEXABLE {
