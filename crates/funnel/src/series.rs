@@ -5,12 +5,36 @@
 //! n² / 2⁶⁵, around 3e-8 at a million series, which is acceptable for
 //! metrics and keeps the hot path free of string comparisons.
 
+use std::collections::{HashMap, HashSet};
+use std::hash::{BuildHasherDefault, Hasher};
+
 use xxhash_rust::xxh3::Xxh3;
 
 use crate::protocol::{Kind, Line};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct SeriesId(pub u64);
+
+/// Series ids are already xxh3 hashes, so maps keyed by them skip hashing.
+#[derive(Default)]
+pub struct IdHasher(u64);
+
+impl Hasher for IdHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, _: &[u8]) {
+        unreachable!("IdHasher only hashes u64 ids");
+    }
+
+    fn write_u64(&mut self, n: u64) {
+        self.0 = n;
+    }
+}
+
+pub type IdMap<V> = HashMap<SeriesId, V, BuildHasherDefault<IdHasher>>;
+pub type IdSet = HashSet<u64, BuildHasherDefault<IdHasher>>;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SeriesKey {

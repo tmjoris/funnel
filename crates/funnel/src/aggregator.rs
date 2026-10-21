@@ -5,13 +5,13 @@
 //! arrive for a closed window are rejected as late rather than reopening it,
 //! which keeps every flushed bucket final.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use funnel_sketch::DDSketch;
 
 use crate::protocol::{Kind, Line};
-use crate::series::{SeriesId, SeriesKey, normalize_tags, series_id};
+use crate::series::{IdMap, SeriesId, SeriesKey, normalize_tags, series_id};
 
 #[derive(Clone, Copy, Debug)]
 pub struct Config {
@@ -108,8 +108,8 @@ struct SeriesEntry {
 
 pub struct Aggregator {
     config: Config,
-    windows: BTreeMap<u64, HashMap<SeriesId, Value>>,
-    series: HashMap<SeriesId, SeriesEntry>,
+    windows: BTreeMap<u64, IdMap<Value>>,
+    series: IdMap<SeriesEntry>,
     buckets: usize,
     /// Every window starting before this has been flushed.
     closed_before: u64,
@@ -121,7 +121,7 @@ impl Aggregator {
         Aggregator {
             config,
             windows: BTreeMap::new(),
-            series: HashMap::new(),
+            series: IdMap::default(),
             buckets: 0,
             closed_before: 0,
         }

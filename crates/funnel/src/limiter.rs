@@ -18,12 +18,11 @@
 //! limiter: simple and cheap, at the cost of letting a tenant briefly
 //! exceed the limit right after the boundary.
 
-use std::collections::{HashMap, HashSet};
-use std::hash::{BuildHasherDefault, Hasher};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use crate::hll::HyperLogLog;
-use crate::series::SeriesId;
+use crate::series::{IdSet, SeriesId};
 
 #[derive(Clone, Copy, Debug)]
 pub struct Config {
@@ -39,26 +38,6 @@ impl Default for Config {
         }
     }
 }
-
-/// Series ids are already xxh3 hashes, so hashing them again is waste.
-#[derive(Default)]
-pub struct IdHasher(u64);
-
-impl Hasher for IdHasher {
-    fn finish(&self) -> u64 {
-        self.0
-    }
-
-    fn write(&mut self, _: &[u8]) {
-        unreachable!("IdHasher only hashes u64 ids");
-    }
-
-    fn write_u64(&mut self, n: u64) {
-        self.0 = n;
-    }
-}
-
-pub type IdSet = HashSet<u64, BuildHasherDefault<IdHasher>>;
 
 /// Admitted series per tenant, shared by every shard's limiter.
 #[derive(Default)]
