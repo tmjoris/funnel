@@ -151,10 +151,37 @@ impl Store {
     }
 
     pub fn merge(&mut self, other: &Store) {
-        for (i, c) in other.iter() {
-            self.add(i, c);
-        }
         self.collapsed |= other.collapsed;
+        if other.count == 0 {
+            return;
+        }
+        let (lo, hi) = if self.count == 0 {
+            (other.min, other.max)
+        } else {
+            (self.min.min(other.min), self.max.max(other.max))
+        };
+        if (hi as i64 - lo as i64 + 1) > self.max_bins as i64 {
+            // Needs collapsing; the per-bin path already handles that.
+            for (i, c) in other.iter() {
+                self.add(i, c);
+            }
+            return;
+        }
+        // Fits without collapsing: one resize, then add the overlapping
+        // slices element-wise.
+        self.ensure(lo, hi);
+        let dst = (other.min - self.offset) as usize;
+        let src = (other.min - other.offset) as usize;
+        let len = (other.max - other.min + 1) as usize;
+        for (d, s) in self.bins[dst..dst + len]
+            .iter_mut()
+            .zip(&other.bins[src..src + len])
+        {
+            *d += s;
+        }
+        self.count += other.count;
+        self.min = lo;
+        self.max = hi;
     }
 
     pub fn memory_bytes(&self) -> usize {

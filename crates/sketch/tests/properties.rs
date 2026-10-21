@@ -61,8 +61,11 @@ proptest! {
         a in prop::collection::vec(value(), 0..500),
         b in prop::collection::vec(value(), 0..500),
         kind in mapping_kind(),
+        max_bins in prop_oneof![8u32..64, Just(1 << 16)],
     ) {
-        let config = Config { mapping: kind, max_bins: 1 << 16, ..Config::default() };
+        // Collapsing the lowest bins commutes with merging: each part's cutoff
+        // is at or below the merged cutoff, so tight budgets must agree too.
+        let config = Config { mapping: kind, max_bins, ..Config::default() };
         let mut merged = sketch(&a, config);
         merged.merge(&sketch(&b, config)).unwrap();
         let whole = sketch(&[a, b].concat(), config);
