@@ -118,6 +118,7 @@ async fn main() -> anyhow::Result<()> {
         router: router.clone(),
         reports,
         default_tenant: tenant,
+        data_dir: Arc::new(args.data_dir.clone()),
     });
     axum::serve(listener, app)
         .with_graceful_shutdown(async {

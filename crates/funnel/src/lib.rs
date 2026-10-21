@@ -3,6 +3,7 @@ pub mod hll;
 pub mod http;
 pub mod limiter;
 pub mod protocol;
+pub mod query;
 pub mod router;
 pub mod series;
 pub mod shard;
