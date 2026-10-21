@@ -1,0 +1,47 @@
+name: Benchmarks
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: ["crates/sketch/**", ".github/workflows/bench.yml"]
+
+env:
+  CARGO_TERM_COLOR: never
+
+jobs:
+  sketch:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Machine
+        run: |
+          {
+            echo "## ${{ matrix.runner }}"
+            echo '```'
+            lscpu | grep -E 'Architecture|Model name|^CPU\(s\)|Thread|MHz'
+            free -h | head -2
+            rustc --version
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Accuracy
+        run: |
+          cargo run --release -p funnel-sketch --example accuracy | tee accuracy.txt
+          { echo '### Accuracy'; echo '```'; cat accuracy.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+      - name: Speed
+        run: |
+          cargo bench -p funnel-sketch --bench compare -- --output-format bencher | tee bench.txt
+          { echo '### Speed'; echo '```'; grep '^test ' bench.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sketch-bench-${{ matrix.runner }}
+          path: |
+            accuracy.txt
+            bench.txt
+            target/criterion
