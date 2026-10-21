@@ -145,8 +145,20 @@ impl Aggregator {
     ) -> Result<SeriesId, Reject> {
         normalize_tags(&mut line.tags);
         let id = series_id(tenant, line.name, line.kind, &line.tags);
+        self.insert_prepared(now, id, tenant, line).map(|()| id)
+    }
+
+    /// Like [`insert`](Self::insert) for a line whose tags are normalized and
+    /// whose series id the caller already computed.
+    pub fn insert_prepared(
+        &mut self,
+        now: u64,
+        id: SeriesId,
+        tenant: &str,
+        line: &Line<'_>,
+    ) -> Result<(), Reject> {
         if line.values.is_empty() {
-            return Ok(id);
+            return Ok(());
         }
         let ts = line.timestamp.unwrap_or(now);
         if ts > now.saturating_add(self.config.max_future_secs) {
@@ -177,7 +189,7 @@ impl Aggregator {
                     .windows += 1;
             }
         }
-        Ok(id)
+        Ok(())
     }
 
     /// Closes every window that ended at least `grace` seconds before `now`.

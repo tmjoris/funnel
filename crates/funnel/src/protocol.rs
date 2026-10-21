@@ -127,6 +127,28 @@ pub fn parse_line(line: &str) -> Result<Line<'_>, ParseError> {
     Ok(parsed)
 }
 
+/// Tag that selects the tenant on protocols without their own way to say it
+/// (UDP). It is removed from the tags so it does not count toward the series.
+pub const TENANT_TAG: &str = "tenant";
+
+/// Removes the `tenant` tag from `line` and returns its value.
+pub fn take_tenant<'a>(line: &mut Line<'a>) -> Result<Option<&'a str>, ParseError> {
+    let Some(i) = line.tags.iter().position(|(k, _)| *k == TENANT_TAG) else {
+        return Ok(None);
+    };
+    let (_, tenant) = line.tags.remove(i);
+    if valid_name(tenant) {
+        Ok(Some(tenant))
+    } else {
+        Err(ParseError::Tag)
+    }
+}
+
+/// Tenant names follow the metric name rules.
+pub fn valid_tenant(s: &str) -> bool {
+    valid_name(s)
+}
+
 fn valid_name(s: &str) -> bool {
     !s.is_empty()
         && s.len() <= MAX_NAME_LEN
@@ -196,6 +218,17 @@ mod tests {
         ] {
             assert_eq!(parse_line(line).unwrap_err(), err, "{line:?}");
         }
+    }
+
+    #[test]
+    fn tenant_tag_is_extracted() {
+        let mut l = parse_line("a:1|c|#env:prod,tenant:acme").unwrap();
+        assert_eq!(take_tenant(&mut l), Ok(Some("acme")));
+        assert_eq!(l.tags, [("env", "prod")]);
+        let mut l = parse_line("a:1|c|#tenant:").unwrap();
+        assert_eq!(take_tenant(&mut l), Err(ParseError::Tag));
+        let mut l = parse_line("a:1|c").unwrap();
+        assert_eq!(take_tenant(&mut l), Ok(None));
     }
 
     #[test]
