@@ -34,7 +34,7 @@ counters!(
     parse_errors,
     dropped_overload,
     rejected_cardinality,
-    rejected_late,
+    rejected_too_old,
     rejected_future,
     rejected_overflow,
     lines_accepted,

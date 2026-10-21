@@ -89,7 +89,7 @@ fn run(
 }
 
 fn process(batch: &Batch, agg: &mut Aggregator, limiter: &mut Limiter, stats: &Stats) {
-    let (mut accepted, mut cardinality, mut late, mut future, mut overflow) = (0, 0, 0, 0, 0);
+    let (mut accepted, mut cardinality, mut too_old, mut future, mut overflow) = (0, 0, 0, 0, 0);
     for raw in batch.text.lines() {
         // The router already validated these lines.
         let Ok(mut line) = parse_line(raw) else {
@@ -101,20 +101,29 @@ fn process(batch: &Batch, agg: &mut Aggregator, limiter: &mut Limiter, stats: &S
         let tenant = tenant.unwrap_or(&batch.default_tenant);
         normalize_tags(&mut line.tags);
         let id = series_id(tenant, line.name, line.kind, &line.tags);
+        // Time checks come first so that a point about to be rejected does
+        // not claim a series slot.
+        if let Err(reject) = agg.check_time(batch.now, &line) {
+            match reject {
+                Reject::TooOld => too_old += 1,
+                _ => future += 1,
+            }
+            continue;
+        }
         if !limiter.check(batch.now, tenant, id) {
             cardinality += 1;
             continue;
         }
         match agg.insert_prepared(batch.now, id, tenant, &line) {
             Ok(()) => accepted += 1,
-            Err(Reject::Late) => late += 1,
+            Err(Reject::TooOld) => too_old += 1,
             Err(Reject::Future) => future += 1,
             Err(Reject::Overflow) => overflow += 1,
         }
     }
     Stats::add(&stats.lines_accepted, accepted);
     Stats::add(&stats.rejected_cardinality, cardinality);
-    Stats::add(&stats.rejected_late, late);
+    Stats::add(&stats.rejected_too_old, too_old);
     Stats::add(&stats.rejected_future, future);
     Stats::add(&stats.rejected_overflow, overflow);
 }
