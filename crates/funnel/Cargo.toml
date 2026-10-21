@@ -20,4 +20,10 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 
 [dev-dependencies]
+arrow-array = "60"
+arrow-schema = "60"
+bytes = "1.12.1"
+loadgen = { path = "../loadgen" }
+parquet = { version = "60", default-features = false, features = ["arrow", "zstd"] }
 proptest = "1.12"
+zstd = "0.13"
