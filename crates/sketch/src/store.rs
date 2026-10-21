@@ -7,8 +7,9 @@
 //! Counts are whole numbers of [`UNIT`]ths of a value, like cents of a
 //! dollar, so that sampled values can carry fractional weights (a StatsD
 //! value sent at `@0.3` stands for 3.33 values) while every add stays an
-//! integer add. Adds saturate instead of wrapping; a store overflows only
-//! after about 2.8e14 values.
+//! integer add. Adds are plain adds so that merges vectorize; the sketch
+//! checks its total before every insert and merge, and no bin or store
+//! count can exceed that total.
 
 /// Count units per value.
 pub const UNIT: u64 = 1 << 16;
@@ -67,9 +68,8 @@ impl Store {
             // Fast path: inside the allocated window, and the window is never
             // wider than max_bins + padding, so only the span check remains.
             if index >= self.min && index <= self.max {
-                let slot = &mut self.bins[rel as usize];
-                *slot = slot.saturating_add(n);
-                self.count = self.count.saturating_add(n);
+                self.bins[rel as usize] += n;
+                self.count += n;
                 return;
             }
         }
@@ -89,9 +89,8 @@ impl Store {
         }
         let was_empty = self.count == 0;
         self.ensure(lo, hi);
-        let slot = &mut self.bins[(index - self.offset) as usize];
-        *slot = slot.saturating_add(n);
-        self.count = self.count.saturating_add(n);
+        self.bins[(index - self.offset) as usize] += n;
+        self.count += n;
         self.min = if was_empty {
             index
         } else {
@@ -110,10 +109,10 @@ impl Store {
             return;
         }
         // Counts only move between bins, so the total stays as it is.
-        let mut folded: u64 = 0;
+        let mut folded = 0;
         for i in self.min..lo.min(self.max + 1) {
             let slot = &mut self.bins[(i - self.offset) as usize];
-            folded = folded.saturating_add(*slot);
+            folded += *slot;
             *slot = 0;
         }
         if folded == 0 {
@@ -123,8 +122,7 @@ impl Store {
         let max = self.max.max(lo);
         self.min = lo;
         self.ensure(lo, max);
-        let slot = &mut self.bins[(lo - self.offset) as usize];
-        *slot = slot.saturating_add(folded);
+        self.bins[(lo - self.offset) as usize] += folded;
         self.max = max;
     }
 
@@ -189,9 +187,9 @@ impl Store {
             .iter_mut()
             .zip(&other.bins[src..src + len])
         {
-            *d = d.saturating_add(*s);
+            *d += s;
         }
-        self.count = self.count.saturating_add(other.count);
+        self.count += other.count;
         self.min = lo;
         self.max = hi;
     }
@@ -241,15 +239,5 @@ mod tests {
         s.add(13, 1);
         s.add(-100, 1);
         assert_eq!(s.iter().collect::<Vec<_>>(), [(10, 2), (13, 1)]);
-    }
-
-    #[test]
-    fn saturates_instead_of_wrapping() {
-        let mut s = Store::new(10);
-        s.add(1, u64::MAX - 1);
-        s.add(1, 5);
-        s.add(2, 5);
-        assert_eq!(s.count(), u64::MAX);
-        assert_eq!(s.iter().next(), Some((1, u64::MAX)));
     }
 }

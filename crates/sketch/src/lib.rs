@@ -87,8 +87,9 @@ impl DDSketch {
     /// Adds `x` with weight `n`, e.g. `1 / rate` for a StatsD value sent with
     /// a sample rate. Weights need not be whole: they are stored in units of
     /// 1/65536, so 1/0.3 is kept to within about one part in a million.
-    /// Non-finite values, and weights below 1/65536 or above about 1.4e14,
-    /// are ignored and reported as `false`.
+    /// Non-finite values, weights below 1/65536 or above about 1.4e14, and
+    /// inserts that would take the total past about 2.8e14 values are
+    /// ignored and reported as `false`.
     #[inline]
     pub fn add_n(&mut self, x: f64, n: f64) -> bool {
         let units = (n * UNIT as f64).round();
@@ -100,6 +101,11 @@ impl DDSketch {
 
     #[inline]
     fn add_units(&mut self, x: f64, units: u64, weight: f64) -> bool {
+        // Every bin and store count is at most the total, so checking the
+        // total once keeps all of them from overflowing.
+        let Some(total) = self.count.checked_add(units) else {
+            return false;
+        };
         if !x.is_finite() {
             return false;
         }
@@ -108,9 +114,9 @@ impl DDSketch {
         } else if x <= -MIN_INDEXABLE {
             self.negative.add(self.mapping.index(-x), units);
         } else {
-            self.zero = self.zero.saturating_add(units);
+            self.zero += units;
         }
-        self.count = self.count.saturating_add(units);
+        self.count = total;
         self.sum += x * weight;
         self.min = self.min.min(x);
         self.max = self.max.max(x);
@@ -164,17 +170,17 @@ impl DDSketch {
         let mut seen: u64 = 0;
         // Negative values ascend as their magnitude index descends.
         for (i, c) in self.negative.iter().rev() {
-            seen = seen.saturating_add(c);
+            seen += c;
             if seen as f64 > rank {
                 return Some(self.clamp(-self.mapping.value(i)));
             }
         }
-        seen = seen.saturating_add(self.zero);
+        seen += self.zero;
         if seen as f64 > rank {
             return Some(self.clamp(0.0));
         }
         for (i, c) in self.positive.iter() {
-            seen = seen.saturating_add(c);
+            seen += c;
             if seen as f64 > rank {
                 return Some(self.clamp(self.mapping.value(i)));
             }
@@ -190,12 +196,16 @@ impl DDSketch {
     /// Merges `other` into `self`. Both must use the same alpha and mapping.
     pub fn merge(&mut self, other: &DDSketch) -> Result<(), MergeError> {
         if self.mapping != other.mapping {
-            return Err(MergeError);
+            return Err(MergeError::Mapping);
         }
+        let total = self
+            .count
+            .checked_add(other.count)
+            .ok_or(MergeError::Overflow)?;
         self.positive.merge(&other.positive);
         self.negative.merge(&other.negative);
-        self.zero = self.zero.saturating_add(other.zero);
-        self.count = self.count.saturating_add(other.count);
+        self.zero += other.zero;
+        self.count = total;
         self.sum += other.sum;
         self.min = self.min.min(other.min);
         self.max = self.max.max(other.max);
@@ -209,11 +219,19 @@ impl DDSketch {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct MergeError;
+pub enum MergeError {
+    /// The sketches use different mappings or accuracies.
+    Mapping,
+    /// The merged sketch would hold more than about 2.8e14 values.
+    Overflow,
+}
 
 impl std::fmt::Display for MergeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("sketches use different mappings")
+        f.write_str(match self {
+            MergeError::Mapping => "sketches use different mappings",
+            MergeError::Overflow => "merged sketch would overflow its count",
+        })
     }
 }
 
@@ -265,12 +283,25 @@ mod tests {
     }
 
     #[test]
+    fn refuses_inserts_and_merges_that_would_overflow() {
+        let mut s = DDSketch::default();
+        // 1.4e14 values is 9.2e18 units; two fit under u64::MAX, three do not.
+        assert!(s.add_n(1.0, 1.4e14));
+        assert!(s.add_n(1.0, 1.4e14));
+        assert!(!s.add_n(2.0, 1.4e14));
+        assert_eq!(s.count(), 2.0 * (1.4e14 * 65536.0f64).round() / 65536.0);
+        let copy = s.clone();
+        assert_eq!(s.merge(&copy), Err(MergeError::Overflow));
+        assert_eq!(s.max(), Some(1.0));
+    }
+
+    #[test]
     fn merge_rejects_different_alpha() {
         let mut a = DDSketch::default();
         let b = DDSketch::new(Config {
             alpha: 0.02,
             ..Config::default()
         });
-        assert_eq!(a.merge(&b), Err(MergeError));
+        assert_eq!(a.merge(&b), Err(MergeError::Mapping));
     }
 }

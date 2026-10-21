@@ -94,11 +94,11 @@ impl DDSketch {
         };
         let zero = r.count(units, true)?;
         let (sum, min, max) = (r.f64()?, r.f64()?, r.f64()?);
-        let positive = decode_store(&mut r, max_bins as u32, units)?;
-        let negative = decode_store(&mut r, max_bins as u32, units)?;
-        let count = zero
-            .saturating_add(positive.count())
-            .saturating_add(negative.count());
+        // Bins use plain adds, so the decoder bounds the running total itself.
+        let mut total = zero;
+        let positive = decode_store(&mut r, max_bins as u32, units, &mut total)?;
+        let negative = decode_store(&mut r, max_bins as u32, units, &mut total)?;
+        let count = total;
         let sketch = DDSketch {
             mapping: Mapping::new(kind, alpha),
             positive,
@@ -128,14 +128,21 @@ fn encode_store(store: &Store, units: bool, out: &mut Vec<u8>) {
     }
 }
 
-fn decode_store(r: &mut Reader, max_bins: u32, units: bool) -> Result<Store, DecodeError> {
+fn decode_store(
+    r: &mut Reader,
+    max_bins: u32,
+    units: bool,
+    total: &mut u64,
+) -> Result<Store, DecodeError> {
     let len = r.varint()?;
     let mut store = Store::new(max_bins);
     let mut index = 0i64;
     for _ in 0..len {
         index += unzigzag(r.varint()?);
         let i = i32::try_from(index).map_err(|_| DecodeError::Invalid)?;
-        store.add(i, r.count(units, false)?);
+        let c = r.count(units, false)?;
+        *total = total.checked_add(c).ok_or(DecodeError::Invalid)?;
+        store.add(i, c);
     }
     Ok(store)
 }
