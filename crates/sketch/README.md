@@ -49,13 +49,13 @@ Using `1 / ln 2`, the slope of the exact `log2`, instead of `10/7` breaks
 the bound, and the property tests catch it: proptest finds a value with
 0.1007% error at `alpha = 0.1%`.
 
-## Results
+## Results on a laptop
 
 Intel i5-6200U (2 cores / 4 threads, 2.3 GHz laptop), rustc 1.94, release
 build. Run them yourself with `cargo bench -p funnel-sketch` and
 `cargo run --release -p funnel-sketch --example accuracy`.
 
-**Insert, 100k lognormal latencies**
+### Insert, 100k lognormal latencies
 
 | | time | throughput |
 |---|---|---|
@@ -64,7 +64,7 @@ build. Run them yourself with `cargo bench -p funnel-sketch` and
 | sketches-ddsketch 0.4 | 2.56 ms | 39.0M values/s |
 | tdigest 1.0 (batch insert, its best case) | 5.14 ms | 19.5M values/s |
 
-**Merge 10 / 100 sketches of 100k values total**
+### Merge 10 or 100 sketches of 100k values in total
 
 | | 10 | 100 |
 |---|---|---|
@@ -75,8 +75,10 @@ build. Run them yourself with `cargo bench -p funnel-sketch` and
 Merging resizes the destination once and adds the overlapping slices of the
 two bin arrays.
 
-**Relative error, 1M values** (DDSketch at alpha = 1%, t-digest at
-compression 100)
+### Relative error, 1M values
+
+DDSketch at alpha = 1%, t-digest at compression 100. The data is seeded, so
+these numbers are identical on every machine, including the CI runners below.
 
 | dataset | sketch | p50 | p90 | p99 | p99.9 |
 |---|---|---|---|---|---|
@@ -98,3 +100,35 @@ error in rank, and in a heavy tail or in the gap between two modes a small
 rank error becomes a large value error: 31.9% at p99.9 on the Pareto data. Latency alerts usually fire on exactly those quantiles. Both
 DDSketch implementations stay under 1% everywhere. Encoded, the funnel-sketch
 for each 1M-value dataset is 1.0 to 1.4 KB.
+
+## Results on GitHub Actions runners
+
+The [Benchmarks workflow](../../.github/workflows/bench.yml) runs on every
+push that touches this crate, on `ubuntu-latest` (x86_64) and
+`ubuntu-24.04-arm` (aarch64). Both have 4 vCPUs, and the runs below used
+rustc 1.99.1. The x86 label is a mixed pool: three runs of the same commit
+landed once on an Intel Xeon 6973P-C and twice on an AMD EPYC 9V45, so the
+results are grouped by CPU. The three Neoverse-N2 runs agreed within 1%, the
+two EPYC runs within about 4%.
+
+Insert, 100k lognormal values, in millions of values per second (median):
+
+| CPU | funnel cubic | funnel log | sketches-ddsketch | tdigest batch |
+|---|---|---|---|---|
+| Neoverse-N2, 3 runs | 223.0 | 127.1 | 90.8 | 52.8 |
+| AMD EPYC 9V45, 2 runs | 197.2 | 133.9 | 117.5 | 43.6 |
+| Intel Xeon 6973P-C, 1 run | 172.8 | 98.7 | 115.9 | 41.8 |
+
+Merge 10 sketches (median):
+
+| CPU | funnel-sketch | sketches-ddsketch | tdigest |
+|---|---|---|---|
+| Neoverse-N2 | 1.06 µs | 3.82 µs | 22.6 µs |
+| AMD EPYC 9V45 | 0.76 µs | 2.15 µs | 15.8 µs |
+| Intel Xeon 6973P-C | 0.75 µs | 2.67 µs | 20.3 µs |
+
+The cubic mapping has the fastest inserts on all three CPUs, 1.5 to 2.5
+times sketches-ddsketch. With the log mapping, funnel-sketch is slower than
+sketches-ddsketch on the Xeon, so most of the insert speedup comes from
+skipping `ln`; the bin store by itself is not faster on every CPU. Merging is
+2.8 to 3.6 times faster than sketches-ddsketch everywhere.
