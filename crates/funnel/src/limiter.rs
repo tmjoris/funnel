@@ -13,10 +13,15 @@
 //! new series takes the tenant's lock in the shared [`Budgets`] to claim one
 //! unit of the limit; after warm-up that is rare.
 //!
-//! Windows are fixed (hourly by default). At a window boundary every tenant
-//! starts again from an empty set, the same trade-off as a fixed-window rate
-//! limiter: simple and cheap, at the cost of letting a tenant briefly
-//! exceed the limit right after the boundary.
+//! Windows are fixed (hourly by default). A plain fixed window would let a
+//! tenant that is over its limit keep whichever series happen to arrive
+//! first after each boundary, so long-lived series could lose their place
+//! to new ones and the allowed set would change every hour. Instead, the
+//! series a shard admitted in the previous window keep a reserved slot in
+//! the new one: new series only get the slots that are neither used nor
+//! reserved, and a reservation lapses if its series does not return within
+//! the window. Shards roll over on their flush tick, so for up to a second
+//! after a boundary some shards may not have added their reservations yet.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -49,6 +54,8 @@ pub struct Budgets {
 struct Budget {
     window: u64,
     used: usize,
+    /// Series admitted in the previous window that have not returned yet.
+    reserved: usize,
 }
 
 impl Budgets {
@@ -63,7 +70,11 @@ impl Budgets {
 
 struct Tenant {
     window: u64,
+    /// Window of the last check, to forget tenants that stopped sending.
+    seen: u64,
     allowed: IdSet,
+    /// Admitted in the previous window and not yet seen in this one.
+    previous: IdSet,
     attempted: HyperLogLog,
     rejected_points: u64,
     budget: Arc<Mutex<Budget>>,
@@ -73,10 +84,37 @@ impl Tenant {
     fn new(window: u64, budget: Arc<Mutex<Budget>>) -> Self {
         Tenant {
             window,
+            seen: window,
             allowed: IdSet::default(),
+            previous: IdSet::default(),
             attempted: HyperLogLog::default(),
             rejected_points: 0,
             budget,
+        }
+    }
+
+    /// Moves to a later window, carrying this window's series over as
+    /// reservations if the new window directly follows.
+    fn roll(&mut self, window: u64, window_secs: u64) {
+        let allowed = std::mem::take(&mut self.allowed);
+        self.previous = if window == self.window + window_secs {
+            allowed
+        } else {
+            IdSet::default()
+        };
+        self.window = window;
+        self.attempted = HyperLogLog::default();
+        self.rejected_points = 0;
+        let mut budget = self.budget.lock().unwrap();
+        if window > budget.window {
+            *budget = Budget {
+                window,
+                used: 0,
+                reserved: 0,
+            };
+        }
+        if window == budget.window {
+            budget.reserved += self.previous.len();
         }
     }
 }
@@ -117,24 +155,27 @@ impl Limiter {
                     .or_insert_with(|| Tenant::new(window, budget))
             }
         };
-        if state.window != window {
-            *state = Tenant::new(window, state.budget.clone());
+        // A batch stamped before the current window (it queued across a
+        // boundary) is judged against the current window; never roll back.
+        if window > state.window {
+            state.roll(window, self.config.window_secs);
         }
+        state.seen = state.window;
         state.attempted.insert(id.0);
         if state.allowed.contains(&id.0) {
             return true;
         }
         let admitted = {
             let mut budget = state.budget.lock().unwrap();
-            if window > budget.window {
-                budget.window = window;
-                budget.used = 0;
-            }
-            if window < budget.window {
-                // A batch stamped before a boundary another shard has
-                // already crossed; the old window's budget is gone.
+            if state.window < budget.window {
+                // Another shard has crossed a boundary this one has not
+                // reached on its tick yet; the old budget is gone.
                 true
-            } else if budget.used < self.config.max_series {
+            } else if state.previous.remove(&id.0) {
+                budget.reserved = budget.reserved.saturating_sub(1);
+                budget.used += 1;
+                true
+            } else if budget.used + budget.reserved < self.config.max_series {
                 budget.used += 1;
                 true
             } else {
@@ -147,6 +188,19 @@ impl Limiter {
             state.rejected_points += 1;
         }
         admitted
+    }
+
+    /// Rolls every tenant into the window containing `now` and forgets
+    /// tenants idle for two windows. Shards call this on every flush tick.
+    pub fn tick(&mut self, now: u64) {
+        let secs = self.config.window_secs;
+        let window = now - now % secs;
+        self.tenants.retain(|_, t| t.seen + 2 * secs > window);
+        for t in self.tenants.values_mut() {
+            if window > t.window {
+                t.roll(window, secs);
+            }
+        }
     }
 
     pub fn report(&self) -> Vec<TenantReport> {
@@ -180,6 +234,10 @@ mod tests {
         Limiter::new(config(max_series), Arc::default())
     }
 
+    fn id(i: u64) -> SeriesId {
+        SeriesId(xxhash_rust::xxh3::xxh3_64(&i.to_le_bytes()))
+    }
+
     #[test]
     fn shards_share_one_exact_budget() {
         let budgets = Arc::new(Budgets::default());
@@ -196,20 +254,68 @@ mod tests {
     }
 
     #[test]
-    fn window_boundary_across_shards() {
-        let budgets = Arc::new(Budgets::default());
-        let mut a = Limiter::new(config(1), budgets.clone());
-        let mut b = Limiter::new(config(1), budgets);
-        assert!(a.check(3599, "t", id(1)));
-        assert!(!b.check(3599, "t", id(2)));
-        assert!(a.check(3600, "t", id(3)));
-        assert!(!b.check(3600, "t", id(4)));
-        // A late batch from the old window is not held to the spent budget.
-        assert!(b.check(3599, "t", id(5)));
+    fn returning_series_keep_their_place() {
+        let mut l = limiter(2);
+        assert!(l.check(0, "t", id(1)));
+        assert!(l.check(0, "t", id(2)));
+        // New hour: a newcomer arriving first cannot take a returning
+        // series' slot.
+        assert!(!l.check(3600, "t", id(3)));
+        assert!(l.check(3601, "t", id(1)));
+        assert!(l.check(3602, "t", id(2)));
+        assert!(!l.check(3603, "t", id(3)));
     }
 
-    fn id(i: u64) -> SeriesId {
-        SeriesId(xxhash_rust::xxh3::xxh3_64(&i.to_le_bytes()))
+    #[test]
+    fn reservations_lapse_after_a_window_without_the_series() {
+        let mut l = limiter(2);
+        assert!(l.check(0, "t", id(1)));
+        assert!(l.check(0, "t", id(2)));
+        assert!(l.check(3600, "t", id(1)));
+        assert!(!l.check(3600, "t", id(3)));
+        // Series 2 never came back, so the next window frees its slot.
+        assert!(l.check(7200, "t", id(3)));
+        assert!(l.check(7200, "t", id(1)));
+        assert!(!l.check(7200, "t", id(4)));
+    }
+
+    #[test]
+    fn a_gap_of_more_than_one_window_reserves_nothing() {
+        let mut l = limiter(1);
+        assert!(l.check(0, "t", id(1)));
+        assert!(l.check(7200, "t", id(2)));
+    }
+
+    #[test]
+    fn late_batch_does_not_roll_back() {
+        let mut l = limiter(1);
+        assert!(l.check(3600, "t", id(1)));
+        assert!(!l.check(3599, "t", id(2)));
+        assert!(l.check(3600, "t", id(1)));
+    }
+
+    #[test]
+    fn tick_reserves_across_shards_before_traffic() {
+        let budgets = Arc::new(Budgets::default());
+        let mut a = Limiter::new(config(2), budgets.clone());
+        let mut b = Limiter::new(config(2), budgets);
+        assert!(a.check(0, "t", id(1)));
+        assert!(b.check(0, "t", id(2)));
+        a.tick(3600);
+        b.tick(3600);
+        assert!(!a.check(3600, "t", id(3)));
+        assert!(!b.check(3600, "t", id(4)));
+        assert!(b.check(3600, "t", id(2)));
+    }
+
+    #[test]
+    fn idle_tenants_are_forgotten() {
+        let mut l = limiter(1);
+        assert!(l.check(0, "t", id(1)));
+        l.tick(3600);
+        assert_eq!(l.report().len(), 1);
+        l.tick(7200);
+        assert!(l.report().is_empty());
     }
 
     #[test]
@@ -232,11 +338,12 @@ mod tests {
     }
 
     #[test]
-    fn window_boundary_resets() {
+    fn full_tenant_keeps_old_series_across_the_boundary() {
         let mut l = limiter(1);
         assert!(l.check(3599, "a", id(1)));
         assert!(!l.check(3599, "a", id(2)));
-        assert!(l.check(3600, "a", id(2)));
+        assert!(!l.check(3600, "a", id(2)));
+        assert!(l.check(3600, "a", id(1)));
     }
 
     #[test]

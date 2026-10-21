@@ -93,7 +93,9 @@ fn run(
         }
         if Instant::now() >= next_flush {
             next_flush += config.flush_every;
-            let buckets = agg.flush(unix_now());
+            let now = unix_now();
+            limiter.tick(now);
+            let buckets = agg.flush(now);
             reports.lock().unwrap()[index] = report(&agg, &limiter);
             if !buckets.is_empty() && out.send(buckets).is_err() {
                 return;
