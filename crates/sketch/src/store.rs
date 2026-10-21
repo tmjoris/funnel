@@ -3,16 +3,19 @@
 //! When the range of non-empty bins would exceed `max_bins`, the lowest bins
 //! are folded into the lowest kept bin. Low quantiles lose their guarantee,
 //! high quantiles (the ones latency dashboards care about) keep it.
+//!
+//! Counts are `f64` so that sampled values can carry fractional weights: a
+//! StatsD value sent at `@0.3` stands for 3.33 values, not 3.
 
 #[derive(Clone, Debug)]
 pub struct Store {
-    bins: Vec<u64>,
+    bins: Vec<f64>,
     /// Index of `bins[0]`.
     offset: i32,
-    /// Lowest and highest non-empty indexes; meaningless while `count == 0`.
+    /// Lowest and highest non-empty indexes; meaningless while empty.
     min: i32,
     max: i32,
-    count: u64,
+    count: f64,
     max_bins: u32,
     collapsed: bool,
 }
@@ -25,18 +28,18 @@ impl Store {
             offset: 0,
             min: 0,
             max: 0,
-            count: 0,
+            count: 0.0,
             max_bins,
             collapsed: false,
         }
     }
 
-    pub fn count(&self) -> u64 {
+    pub fn count(&self) -> f64 {
         self.count
     }
 
     pub fn is_empty(&self) -> bool {
-        self.count == 0
+        self.count == 0.0
     }
 
     /// Whether any counts were folded into a higher bin.
@@ -48,13 +51,12 @@ impl Store {
         self.max_bins
     }
 
+    /// Adds `n` to bin `index`. `n` must be positive and finite.
     #[inline]
-    pub fn add(&mut self, index: i32, n: u64) {
-        if n == 0 {
-            return;
-        }
+    pub fn add(&mut self, index: i32, n: f64) {
+        debug_assert!(n > 0.0 && n.is_finite());
         let rel = index.wrapping_sub(self.offset);
-        if self.count > 0 && rel >= 0 && (rel as usize) < self.bins.len() {
+        if !self.is_empty() && rel >= 0 && (rel as usize) < self.bins.len() {
             // Fast path: inside the allocated window, and the window is never
             // wider than max_bins + padding, so only the span check remains.
             if index >= self.min && index <= self.max {
@@ -66,8 +68,9 @@ impl Store {
         self.add_slow(index, n);
     }
 
-    fn add_slow(&mut self, mut index: i32, n: u64) {
-        let (mut lo, hi) = if self.count == 0 {
+    fn add_slow(&mut self, mut index: i32, n: f64) {
+        let was_empty = self.is_empty();
+        let (mut lo, hi) = if was_empty {
             (index, index)
         } else {
             (self.min.min(index), self.max.max(index))
@@ -80,39 +83,35 @@ impl Store {
         self.ensure(lo, hi);
         self.bins[(index - self.offset) as usize] += n;
         self.count += n;
-        self.min = if self.count == n {
-            index
+        if was_empty {
+            self.min = index;
+            self.max = index;
         } else {
-            self.min.min(index)
-        };
-        self.max = if self.count == n {
-            index
-        } else {
-            self.max.max(index)
-        };
+            self.min = self.min.min(index);
+            self.max = self.max.max(index);
+        }
     }
 
     /// Folds every count below `lo` into bin `lo`.
     fn collapse_below(&mut self, lo: i32) {
-        if self.count == 0 || self.min >= lo {
+        if self.is_empty() || self.min >= lo {
             return;
         }
-        let mut folded = 0;
+        // Counts only move between bins, so the total stays as it is.
+        let mut folded = 0.0;
         for i in self.min..lo.min(self.max + 1) {
             let slot = &mut self.bins[(i - self.offset) as usize];
             folded += *slot;
-            *slot = 0;
+            *slot = 0.0;
         }
-        if folded == 0 {
+        if folded == 0.0 {
             return;
         }
         self.collapsed = true;
-        self.count -= folded;
         let max = self.max.max(lo);
         self.min = lo;
         self.ensure(lo, max);
         self.bins[(lo - self.offset) as usize] += folded;
-        self.count += folded;
         self.max = max;
     }
 
@@ -127,8 +126,8 @@ impl Store {
         let pad = (span / 2 + 8).min(self.max_bins as usize) as i32;
         let new_offset = lo.saturating_sub(pad);
         let new_len = (hi.saturating_add(pad) - new_offset + 1) as usize;
-        let mut bins = vec![0u64; new_len];
-        if self.count > 0 {
+        let mut bins = vec![0.0; new_len];
+        if !self.is_empty() {
             for i in self.min.max(new_offset)..=self.max.min(new_offset + new_len as i32 - 1) {
                 bins[(i - new_offset) as usize] = self.bins[(i - self.offset) as usize];
             }
@@ -138,24 +137,24 @@ impl Store {
     }
 
     /// Non-empty bins in ascending index order.
-    pub fn iter(&self) -> impl DoubleEndedIterator<Item = (i32, u64)> + '_ {
-        let (lo, hi) = if self.count == 0 {
+    pub fn iter(&self) -> impl DoubleEndedIterator<Item = (i32, f64)> + '_ {
+        let (lo, hi) = if self.is_empty() {
             (1, 0)
         } else {
             (self.min, self.max)
         };
         (lo..=hi).filter_map(move |i| {
             let c = self.bins[(i - self.offset) as usize];
-            (c > 0).then_some((i, c))
+            (c > 0.0).then_some((i, c))
         })
     }
 
     pub fn merge(&mut self, other: &Store) {
         self.collapsed |= other.collapsed;
-        if other.count == 0 {
+        if other.is_empty() {
             return;
         }
-        let (lo, hi) = if self.count == 0 {
+        let (lo, hi) = if self.is_empty() {
             (other.min, other.max)
         } else {
             (self.min.min(other.min), self.max.max(other.max))
@@ -185,7 +184,7 @@ impl Store {
     }
 
     pub fn memory_bytes(&self) -> usize {
-        self.bins.capacity() * std::mem::size_of::<u64>()
+        self.bins.capacity() * std::mem::size_of::<f64>()
     }
 }
 
@@ -197,11 +196,11 @@ mod tests {
     fn grows_in_both_directions() {
         let mut s = Store::new(1000);
         for i in [5, -20, 300, 0, -20] {
-            s.add(i, 1);
+            s.add(i, 1.0);
         }
         assert_eq!(
             s.iter().collect::<Vec<_>>(),
-            [(-20, 2), (0, 1), (5, 1), (300, 1)]
+            [(-20, 2.0), (0, 1.0), (5, 1.0), (300, 1.0)]
         );
         assert!(!s.collapsed());
     }
@@ -210,24 +209,33 @@ mod tests {
     fn collapses_lowest_bins() {
         let mut s = Store::new(10);
         for i in 0..20 {
-            s.add(i, 1);
+            s.add(i, 1.0);
         }
-        assert_eq!(s.count(), 20);
+        assert_eq!(s.count(), 20.0);
         let bins: Vec<_> = s.iter().collect();
-        assert_eq!(bins.first(), Some(&(10, 11)));
-        assert_eq!(bins.last(), Some(&(19, 1)));
+        assert_eq!(bins.first(), Some(&(10, 11.0)));
+        assert_eq!(bins.last(), Some(&(19, 1.0)));
         assert!(s.collapsed());
         // A value far above pushes everything into one bin.
-        s.add(1000, 1);
-        assert_eq!(s.iter().collect::<Vec<_>>(), [(991, 20), (1000, 1)]);
+        s.add(1000, 1.0);
+        assert_eq!(s.iter().collect::<Vec<_>>(), [(991, 20.0), (1000, 1.0)]);
     }
 
     #[test]
     fn low_value_after_collapse_is_folded_up() {
         let mut s = Store::new(4);
-        s.add(10, 1);
-        s.add(13, 1);
-        s.add(-100, 1);
-        assert_eq!(s.iter().collect::<Vec<_>>(), [(10, 2), (13, 1)]);
+        s.add(10, 1.0);
+        s.add(13, 1.0);
+        s.add(-100, 1.0);
+        assert_eq!(s.iter().collect::<Vec<_>>(), [(10, 2.0), (13, 1.0)]);
+    }
+
+    #[test]
+    fn fractional_counts() {
+        let mut s = Store::new(100);
+        s.add(3, 10.0 / 3.0);
+        s.add(3, 0.5);
+        assert!((s.count() - 3.8333).abs() < 1e-3);
+        assert_eq!(s.iter().count(), 1);
     }
 }

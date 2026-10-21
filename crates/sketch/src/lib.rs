@@ -42,8 +42,8 @@ pub struct DDSketch {
     mapping: Mapping,
     positive: Store,
     negative: Store,
-    zero: u64,
-    count: u64,
+    zero: f64,
+    count: f64,
     sum: f64,
     min: f64,
     max: f64,
@@ -61,8 +61,8 @@ impl DDSketch {
             mapping: Mapping::new(config.mapping, config.alpha),
             positive: Store::new(config.max_bins),
             negative: Store::new(config.max_bins),
-            zero: 0,
-            count: 0,
+            zero: 0.0,
+            count: 0.0,
             sum: 0.0,
             min: f64::INFINITY,
             max: f64::NEG_INFINITY,
@@ -80,17 +80,17 @@ impl DDSketch {
     /// Adds one value. NaN and infinities are ignored and reported as `false`.
     #[inline]
     pub fn add(&mut self, x: f64) -> bool {
-        self.add_n(x, 1)
+        self.add_n(x, 1.0)
     }
 
-    /// Adds `n` copies of `x`, e.g. a StatsD value sent with a sample rate.
+    /// Adds `x` with weight `n`, e.g. `1 / rate` for a StatsD value sent with
+    /// a sample rate. Weights need not be whole. Non-finite values and
+    /// weights that are not positive and finite are ignored and reported as
+    /// `false`.
     #[inline]
-    pub fn add_n(&mut self, x: f64, n: u64) -> bool {
-        if !x.is_finite() {
+    pub fn add_n(&mut self, x: f64, n: f64) -> bool {
+        if !x.is_finite() || !(n > 0.0 && n.is_finite()) {
             return false;
-        }
-        if n == 0 {
-            return true;
         }
         if x >= MIN_INDEXABLE {
             self.positive.add(self.mapping.index(x), n);
@@ -100,18 +100,19 @@ impl DDSketch {
             self.zero += n;
         }
         self.count += n;
-        self.sum += x * n as f64;
+        self.sum += x * n;
         self.min = self.min.min(x);
         self.max = self.max.max(x);
         true
     }
 
-    pub fn count(&self) -> u64 {
+    /// Total weight; the number of values when every weight is 1.
+    pub fn count(&self) -> f64 {
         self.count
     }
 
     pub fn is_empty(&self) -> bool {
-        self.count == 0
+        self.count == 0.0
     }
 
     pub fn sum(&self) -> f64 {
@@ -119,15 +120,15 @@ impl DDSketch {
     }
 
     pub fn min(&self) -> Option<f64> {
-        (self.count > 0).then_some(self.min)
+        (!self.is_empty()).then_some(self.min)
     }
 
     pub fn max(&self) -> Option<f64> {
-        (self.count > 0).then_some(self.max)
+        (!self.is_empty()).then_some(self.max)
     }
 
     pub fn mean(&self) -> Option<f64> {
-        (self.count > 0).then(|| self.sum / self.count as f64)
+        (!self.is_empty()).then(|| self.sum / self.count)
     }
 
     /// Whether the bin limit forced low bins to merge, which voids the
@@ -138,7 +139,7 @@ impl DDSketch {
 
     /// Estimated value at quantile `q` in `[0, 1]`.
     pub fn quantile(&self, q: f64) -> Option<f64> {
-        if self.count == 0 || !(0.0..=1.0).contains(&q) {
+        if self.is_empty() || !(0.0..=1.0).contains(&q) {
             return None;
         }
         if q == 0.0 {
@@ -147,22 +148,22 @@ impl DDSketch {
         if q == 1.0 {
             return Some(self.max);
         }
-        let rank = q * (self.count - 1) as f64;
-        let mut seen = 0u64;
+        let rank = q * (self.count - 1.0);
+        let mut seen = 0.0;
         // Negative values ascend as their magnitude index descends.
         for (i, c) in self.negative.iter().rev() {
             seen += c;
-            if seen as f64 > rank {
+            if seen > rank {
                 return Some(self.clamp(-self.mapping.value(i)));
             }
         }
         seen += self.zero;
-        if seen as f64 > rank {
+        if seen > rank {
             return Some(self.clamp(0.0));
         }
         for (i, c) in self.positive.iter() {
             seen += c;
-            if seen as f64 > rank {
+            if seen > rank {
                 return Some(self.clamp(self.mapping.value(i)));
             }
         }
@@ -223,7 +224,7 @@ mod tests {
         for x in 1..=1000 {
             s.add(x as f64);
         }
-        assert_eq!(s.count(), 1000);
+        assert_eq!(s.count(), 1000.0);
         assert_eq!(s.sum(), 500500.0);
         assert_eq!(s.min(), Some(1.0));
         assert_eq!(s.max(), Some(1000.0));

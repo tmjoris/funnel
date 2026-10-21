@@ -57,6 +57,52 @@ proptest! {
     }
 
     #[test]
+    fn weighted_quantiles_within_relative_error(
+        points in prop::collection::vec(
+            (value(), prop_oneof![Just(1.0), Just(1.0 / 0.3), Just(2.5), Just(10.0)]),
+            1..1000,
+        ),
+        qs in prop::collection::vec(0.0f64..=1.0, 1..20),
+        kind in mapping_kind(),
+    ) {
+        let alpha = 0.01;
+        let mut s = DDSketch::new(Config { alpha, mapping: kind, max_bins: 1 << 16 });
+        for &(v, w) in &points {
+            prop_assert!(s.add_n(v, w));
+        }
+        let mut sorted = points.clone();
+        sorted.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let total: f64 = sorted.iter().map(|p| p.1).sum();
+        prop_assert!((s.count() - total).abs() <= total * 1e-12);
+        for q in qs {
+            if q == 0.0 || q == 1.0 {
+                continue;
+            }
+            // First value whose cumulative weight passes the target rank.
+            // Skip ranks within float noise of a boundary between two values.
+            let rank = q * (s.count() - 1.0);
+            let mut seen = 0.0;
+            let mut want = None;
+            for &(v, w) in &sorted {
+                seen += w;
+                if seen > rank {
+                    want = Some((v, (seen - rank).min(rank - (seen - w))));
+                    break;
+                }
+            }
+            let (want, margin) = want.unwrap_or((sorted.last().unwrap().0, 1.0));
+            if margin.abs() < 1e-6 {
+                continue;
+            }
+            let got = s.quantile(q).unwrap();
+            prop_assert!(
+                (got - want).abs() <= alpha * want.abs() * (1.0 + 1e-9),
+                "q={q} want={want} got={got}"
+            );
+        }
+    }
+
+    #[test]
     fn merge_matches_single_sketch(
         a in prop::collection::vec(value(), 0..500),
         b in prop::collection::vec(value(), 0..500),

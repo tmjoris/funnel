@@ -259,7 +259,7 @@ fn merge(value: &mut Value, line: &Line<'_>) {
             line.values.iter().for_each(|&v| g.add(v));
         }
         Value::Distribution(sketch) => {
-            let weight = (1.0 / line.sample_rate).round().max(1.0) as u64;
+            let weight = 1.0 / line.sample_rate;
             for &v in &line.values {
                 sketch.add_n(v, weight);
             }
@@ -324,7 +324,7 @@ mod tests {
         let Value::Distribution(s) = &out[0].value else {
             panic!()
         };
-        assert_eq!(s.count(), 12);
+        assert_eq!(s.count(), 12.0);
         assert_eq!(s.max(), Some(30.0));
     }
 
