@@ -137,16 +137,20 @@ pub fn take_tenant<'a>(line: &mut Line<'a>) -> Result<Option<&'a str>, ParseErro
         return Ok(None);
     };
     let (_, tenant) = line.tags.remove(i);
-    if valid_name(tenant) {
+    if valid_tenant(tenant) {
         Ok(Some(tenant))
     } else {
         Err(ParseError::Tag)
     }
 }
 
-/// Tenant names follow the metric name rules.
+/// Tenant names become directory names on disk, so they are limited to
+/// ASCII letters, digits, `_` and `-`: no `/`, no `.` and so no `..`.
 pub fn valid_tenant(s: &str) -> bool {
-    valid_name(s)
+    !s.is_empty()
+        && s.len() <= 64
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }
 
 fn valid_name(s: &str) -> bool {
@@ -229,6 +233,16 @@ mod tests {
         assert_eq!(take_tenant(&mut l), Err(ParseError::Tag));
         let mut l = parse_line("a:1|c").unwrap();
         assert_eq!(take_tenant(&mut l), Ok(None));
+    }
+
+    #[test]
+    fn tenants_cannot_name_paths() {
+        for bad in ["", "..", "a/b", "../etc", ".hidden", "a.b", &"x".repeat(65)] {
+            assert!(!valid_tenant(bad), "{bad:?}");
+        }
+        assert!(valid_tenant("acme-prod_2"));
+        let mut l = parse_line("a:1|c|#tenant:../etc").unwrap();
+        assert_eq!(take_tenant(&mut l), Err(ParseError::Tag));
     }
 
     #[test]
