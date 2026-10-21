@@ -7,6 +7,12 @@
 //! plus a 4 KiB HyperLogLog of every series it attempted, which reports how
 //! far over the limit a tenant is pushing.
 //!
+//! Every shard has its own limiter, and the router sends each series to one
+//! shard, so a tenant's distinct count is the sum of its per-shard sets.
+//! Known series are checked against the local set without locking. Only a
+//! new series takes the tenant's lock in the shared [`Budgets`] to claim one
+//! unit of the limit; after warm-up that is rare.
+//!
 //! Windows are fixed (hourly by default). At a window boundary every tenant
 //! starts again from an empty set, the same trade-off as a fixed-window rate
 //! limiter: simple and cheap, at the cost of letting a tenant briefly
@@ -14,6 +20,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::hash::{BuildHasherDefault, Hasher};
+use std::sync::{Arc, Mutex};
 
 use crate::hll::HyperLogLog;
 use crate::series::SeriesId;
@@ -53,15 +60,49 @@ impl Hasher for IdHasher {
 
 pub type IdSet = HashSet<u64, BuildHasherDefault<IdHasher>>;
 
+/// Admitted series per tenant, shared by every shard's limiter.
 #[derive(Default)]
+pub struct Budgets {
+    tenants: Mutex<HashMap<String, Arc<Mutex<Budget>>>>,
+}
+
+#[derive(Default)]
+struct Budget {
+    window: u64,
+    used: usize,
+}
+
+impl Budgets {
+    fn get(&self, tenant: &str) -> Arc<Mutex<Budget>> {
+        let mut tenants = self.tenants.lock().unwrap();
+        match tenants.get(tenant) {
+            Some(b) => b.clone(),
+            None => tenants.entry(tenant.to_owned()).or_default().clone(),
+        }
+    }
+}
+
 struct Tenant {
     window: u64,
     allowed: IdSet,
     attempted: HyperLogLog,
     rejected_points: u64,
+    budget: Arc<Mutex<Budget>>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+impl Tenant {
+    fn new(window: u64, budget: Arc<Mutex<Budget>>) -> Self {
+        Tenant {
+            window,
+            allowed: IdSet::default(),
+            attempted: HyperLogLog::default(),
+            rejected_points: 0,
+            budget,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
 pub struct TenantReport {
     pub tenant: String,
     pub allowed_series: usize,
@@ -71,13 +112,16 @@ pub struct TenantReport {
 
 pub struct Limiter {
     config: Config,
+    budgets: Arc<Budgets>,
     tenants: HashMap<String, Tenant>,
 }
 
 impl Limiter {
-    pub fn new(config: Config) -> Self {
+    /// A limiter for one shard; all shards must share `budgets`.
+    pub fn new(config: Config, budgets: Arc<Budgets>) -> Self {
         Limiter {
             config,
+            budgets,
             tenants: HashMap::new(),
         }
     }
@@ -87,24 +131,43 @@ impl Limiter {
         let window = now - now % self.config.window_secs;
         let state = match self.tenants.get_mut(tenant) {
             Some(state) => state,
-            None => self.tenants.entry(tenant.to_owned()).or_default(),
+            None => {
+                let budget = self.budgets.get(tenant);
+                self.tenants
+                    .entry(tenant.to_owned())
+                    .or_insert_with(|| Tenant::new(window, budget))
+            }
         };
         if state.window != window {
-            *state = Tenant {
-                window,
-                ..Tenant::default()
-            };
+            *state = Tenant::new(window, state.budget.clone());
         }
         state.attempted.insert(id.0);
         if state.allowed.contains(&id.0) {
             return true;
         }
-        if state.allowed.len() < self.config.max_series {
+        let admitted = {
+            let mut budget = state.budget.lock().unwrap();
+            if window > budget.window {
+                budget.window = window;
+                budget.used = 0;
+            }
+            if window < budget.window {
+                // A batch stamped before a boundary another shard has
+                // already crossed; the old window's budget is gone.
+                true
+            } else if budget.used < self.config.max_series {
+                budget.used += 1;
+                true
+            } else {
+                false
+            }
+        };
+        if admitted {
             state.allowed.insert(id.0);
-            return true;
+        } else {
+            state.rejected_points += 1;
         }
-        state.rejected_points += 1;
-        false
+        admitted
     }
 
     pub fn report(&self) -> Vec<TenantReport> {
@@ -127,11 +190,43 @@ impl Limiter {
 mod tests {
     use super::*;
 
-    fn limiter(max_series: usize) -> Limiter {
-        Limiter::new(Config {
+    fn config(max_series: usize) -> Config {
+        Config {
             max_series,
             window_secs: 3600,
-        })
+        }
+    }
+
+    fn limiter(max_series: usize) -> Limiter {
+        Limiter::new(config(max_series), Arc::default())
+    }
+
+    #[test]
+    fn shards_share_one_exact_budget() {
+        let budgets = Arc::new(Budgets::default());
+        let mut a = Limiter::new(config(3), budgets.clone());
+        let mut b = Limiter::new(config(3), budgets);
+        assert!(a.check(0, "t", id(1)));
+        assert!(a.check(0, "t", id(2)));
+        assert!(b.check(0, "t", id(3)));
+        assert!(!b.check(0, "t", id(4)));
+        assert!(!a.check(0, "t", id(5)));
+        // Known series stay allowed on their own shard.
+        assert!(a.check(1, "t", id(1)));
+        assert!(b.check(1, "t", id(3)));
+    }
+
+    #[test]
+    fn window_boundary_across_shards() {
+        let budgets = Arc::new(Budgets::default());
+        let mut a = Limiter::new(config(1), budgets.clone());
+        let mut b = Limiter::new(config(1), budgets);
+        assert!(a.check(3599, "t", id(1)));
+        assert!(!b.check(3599, "t", id(2)));
+        assert!(a.check(3600, "t", id(3)));
+        assert!(!b.check(3600, "t", id(4)));
+        // A late batch from the old window is not held to the spent budget.
+        assert!(b.check(3599, "t", id(5)));
     }
 
     fn id(i: u64) -> SeriesId {
