@@ -16,7 +16,7 @@ pub use encoding::DecodeError;
 pub use mapping::{Mapping, MappingKind};
 
 use mapping::MIN_INDEXABLE;
-use store::Store;
+use store::{Store, UNIT};
 
 #[derive(Clone, Copy, Debug)]
 pub struct Config {
@@ -42,8 +42,9 @@ pub struct DDSketch {
     mapping: Mapping,
     positive: Store,
     negative: Store,
-    zero: f64,
-    count: f64,
+    /// Counts are in `store::UNIT`ths of a value.
+    zero: u64,
+    count: u64,
     sum: f64,
     min: f64,
     max: f64,
@@ -61,8 +62,8 @@ impl DDSketch {
             mapping: Mapping::new(config.mapping, config.alpha),
             positive: Store::new(config.max_bins),
             negative: Store::new(config.max_bins),
-            zero: 0.0,
-            count: 0.0,
+            zero: 0,
+            count: 0,
             sum: 0.0,
             min: f64::INFINITY,
             max: f64::NEG_INFINITY,
@@ -80,27 +81,37 @@ impl DDSketch {
     /// Adds one value. NaN and infinities are ignored and reported as `false`.
     #[inline]
     pub fn add(&mut self, x: f64) -> bool {
-        self.add_n(x, 1.0)
+        self.add_units(x, UNIT, 1.0)
     }
 
     /// Adds `x` with weight `n`, e.g. `1 / rate` for a StatsD value sent with
-    /// a sample rate. Weights need not be whole. Non-finite values and
-    /// weights that are not positive and finite are ignored and reported as
-    /// `false`.
+    /// a sample rate. Weights need not be whole: they are stored in units of
+    /// 1/65536, so 1/0.3 is kept to within about one part in a million.
+    /// Non-finite values, and weights below 1/65536 or above about 1.4e14,
+    /// are ignored and reported as `false`.
     #[inline]
     pub fn add_n(&mut self, x: f64, n: f64) -> bool {
-        if !x.is_finite() || n <= 0.0 || !n.is_finite() {
+        let units = (n * UNIT as f64).round();
+        if !(units >= 1.0 && units < (1u64 << 63) as f64) {
+            return false;
+        }
+        self.add_units(x, units as u64, n)
+    }
+
+    #[inline]
+    fn add_units(&mut self, x: f64, units: u64, weight: f64) -> bool {
+        if !x.is_finite() {
             return false;
         }
         if x >= MIN_INDEXABLE {
-            self.positive.add(self.mapping.index(x), n);
+            self.positive.add(self.mapping.index(x), units);
         } else if x <= -MIN_INDEXABLE {
-            self.negative.add(self.mapping.index(-x), n);
+            self.negative.add(self.mapping.index(-x), units);
         } else {
-            self.zero += n;
+            self.zero = self.zero.saturating_add(units);
         }
-        self.count += n;
-        self.sum += x * n;
+        self.count = self.count.saturating_add(units);
+        self.sum += x * weight;
         self.min = self.min.min(x);
         self.max = self.max.max(x);
         true
@@ -108,11 +119,11 @@ impl DDSketch {
 
     /// Total weight; the number of values when every weight is 1.
     pub fn count(&self) -> f64 {
-        self.count
+        self.count as f64 / UNIT as f64
     }
 
     pub fn is_empty(&self) -> bool {
-        self.count == 0.0
+        self.count == 0
     }
 
     pub fn sum(&self) -> f64 {
@@ -128,7 +139,7 @@ impl DDSketch {
     }
 
     pub fn mean(&self) -> Option<f64> {
-        (!self.is_empty()).then(|| self.sum / self.count)
+        (!self.is_empty()).then(|| self.sum / self.count())
     }
 
     /// Whether the bin limit forced low bins to merge, which voids the
@@ -148,22 +159,23 @@ impl DDSketch {
         if q == 1.0 {
             return Some(self.max);
         }
-        let rank = q * (self.count - 1.0);
-        let mut seen = 0.0;
+        // Rank in units; UNIT is a power of two, so this scales exactly.
+        let rank = q * (self.count as f64 - UNIT as f64);
+        let mut seen: u64 = 0;
         // Negative values ascend as their magnitude index descends.
         for (i, c) in self.negative.iter().rev() {
-            seen += c;
-            if seen > rank {
+            seen = seen.saturating_add(c);
+            if seen as f64 > rank {
                 return Some(self.clamp(-self.mapping.value(i)));
             }
         }
-        seen += self.zero;
-        if seen > rank {
+        seen = seen.saturating_add(self.zero);
+        if seen as f64 > rank {
             return Some(self.clamp(0.0));
         }
         for (i, c) in self.positive.iter() {
-            seen += c;
-            if seen > rank {
+            seen = seen.saturating_add(c);
+            if seen as f64 > rank {
                 return Some(self.clamp(self.mapping.value(i)));
             }
         }
@@ -182,8 +194,8 @@ impl DDSketch {
         }
         self.positive.merge(&other.positive);
         self.negative.merge(&other.negative);
-        self.zero += other.zero;
-        self.count += other.count;
+        self.zero = self.zero.saturating_add(other.zero);
+        self.count = self.count.saturating_add(other.count);
         self.sum += other.sum;
         self.min = self.min.min(other.min);
         self.max = self.max.max(other.max);

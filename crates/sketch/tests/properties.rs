@@ -70,7 +70,12 @@ proptest! {
         for &(v, w) in &points {
             prop_assert!(s.add_n(v, w));
         }
-        let mut sorted = points.clone();
+        // The sketch keeps weights in 1/65536 units; compare against the
+        // same rounded weights so this checks the sketch, not the rounding.
+        let mut sorted: Vec<(f64, f64)> = points
+            .iter()
+            .map(|&(v, w)| (v, (w * 65536.0).round() / 65536.0))
+            .collect();
         sorted.sort_by(|a, b| a.0.total_cmp(&b.0));
         let total: f64 = sorted.iter().map(|p| p.1).sum();
         prop_assert!((s.count() - total).abs() <= total * 1e-12);

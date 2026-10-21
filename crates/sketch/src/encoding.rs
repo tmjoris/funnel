@@ -2,21 +2,21 @@
 //!
 //! Layout: version, mapping kind, alpha (f64), max_bins, a flags byte, zero
 //! count, sum, min, max, then each store as `len` followed by
-//! `(index delta, count)` pairs. Index deltas are zigzag varints;
-//! neighbouring bins have delta 1. Counts are varints when every count in
-//! the sketch is a whole number, which is the case without sampling and for
-//! rates like 0.1 or 0.5, so a typical bin costs two bytes. Fractional
-//! counts (rate 0.3) are stored as raw f64. The total count is not stored;
-//! it is the sum of the bins.
+//! `(index delta, count)` pairs, all varints. Index deltas are zigzagged;
+//! neighbouring bins have delta 1. Counts are in units of 1/65536 of a value
+//! in memory. When every count is a whole number of values, which is the
+//! case without sampling and for rates like 0.1 or 0.5, they are written as
+//! values and a typical bin costs two bytes; otherwise (rate 0.3) they are
+//! written in units, about four bytes per bin. The total count is not
+//! stored; it is the sum of the bins.
 
 use crate::DDSketch;
 use crate::mapping::{Mapping, MappingKind};
-use crate::store::Store;
+use crate::store::{Store, UNIT};
 
-const VERSION: u8 = 2;
-const FLOAT_COUNTS: u8 = 1;
-/// Largest f64 below which every whole number is exact.
-const MAX_EXACT: f64 = (1u64 << 53) as f64;
+const VERSION: u8 = 3;
+/// Counts are written in units rather than whole values.
+const UNIT_COUNTS: u8 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DecodeError {
@@ -39,26 +39,26 @@ impl std::fmt::Display for DecodeError {
 
 impl std::error::Error for DecodeError {}
 
-fn whole(c: f64) -> bool {
-    c.fract() == 0.0 && c < MAX_EXACT
+fn whole(c: u64) -> bool {
+    c.is_multiple_of(UNIT)
 }
 
 impl DDSketch {
     pub fn encode(&self, out: &mut Vec<u8>) {
-        let float = !(whole(self.zero)
+        let units = !(whole(self.zero)
             && self.positive.iter().all(|(_, c)| whole(c))
             && self.negative.iter().all(|(_, c)| whole(c)));
         out.push(VERSION);
         out.push(self.mapping.kind() as u8);
         out.extend_from_slice(&self.mapping.alpha().to_le_bytes());
         put_varint(out, self.positive.max_bins() as u64);
-        out.push(if float { FLOAT_COUNTS } else { 0 });
-        put_count(out, self.zero, float);
+        out.push(if units { UNIT_COUNTS } else { 0 });
+        put_count(out, self.zero, units);
         for v in [self.sum, self.min, self.max] {
             out.extend_from_slice(&v.to_le_bytes());
         }
-        encode_store(&self.positive, float, out);
-        encode_store(&self.negative, float, out);
+        encode_store(&self.positive, units, out);
+        encode_store(&self.negative, units, out);
     }
 
     pub fn to_bytes(&self) -> Vec<u8> {
@@ -87,16 +87,18 @@ impl DDSketch {
         if max_bins == 0 || max_bins > u32::MAX as u64 {
             return Err(DecodeError::Invalid);
         }
-        let float = match r.byte()? {
+        let units = match r.byte()? {
             0 => false,
-            FLOAT_COUNTS => true,
+            UNIT_COUNTS => true,
             _ => return Err(DecodeError::Invalid),
         };
-        let zero = r.count(float, true)?;
+        let zero = r.count(units, true)?;
         let (sum, min, max) = (r.f64()?, r.f64()?, r.f64()?);
-        let positive = decode_store(&mut r, max_bins as u32, float)?;
-        let negative = decode_store(&mut r, max_bins as u32, float)?;
-        let count = zero + positive.count() + negative.count();
+        let positive = decode_store(&mut r, max_bins as u32, units)?;
+        let negative = decode_store(&mut r, max_bins as u32, units)?;
+        let count = zero
+            .saturating_add(positive.count())
+            .saturating_add(negative.count());
         let sketch = DDSketch {
             mapping: Mapping::new(kind, alpha),
             positive,
@@ -104,40 +106,36 @@ impl DDSketch {
             zero,
             count,
             sum,
-            min: if count > 0.0 { min } else { f64::INFINITY },
-            max: if count > 0.0 { max } else { f64::NEG_INFINITY },
+            min: if count > 0 { min } else { f64::INFINITY },
+            max: if count > 0 { max } else { f64::NEG_INFINITY },
         };
         Ok((sketch, r.pos))
     }
 }
 
-fn put_count(out: &mut Vec<u8>, c: f64, float: bool) {
-    if float {
-        out.extend_from_slice(&c.to_le_bytes());
-    } else {
-        put_varint(out, c as u64);
-    }
+fn put_count(out: &mut Vec<u8>, c: u64, units: bool) {
+    put_varint(out, if units { c } else { c / UNIT });
 }
 
-fn encode_store(store: &Store, float: bool, out: &mut Vec<u8>) {
+fn encode_store(store: &Store, units: bool, out: &mut Vec<u8>) {
     let bins: Vec<_> = store.iter().collect();
     put_varint(out, bins.len() as u64);
     let mut prev = 0i64;
     for (i, c) in bins {
         put_varint(out, zigzag(i as i64 - prev));
-        put_count(out, c, float);
+        put_count(out, c, units);
         prev = i as i64;
     }
 }
 
-fn decode_store(r: &mut Reader, max_bins: u32, float: bool) -> Result<Store, DecodeError> {
+fn decode_store(r: &mut Reader, max_bins: u32, units: bool) -> Result<Store, DecodeError> {
     let len = r.varint()?;
     let mut store = Store::new(max_bins);
     let mut index = 0i64;
     for _ in 0..len {
         index += unzigzag(r.varint()?);
         let i = i32::try_from(index).map_err(|_| DecodeError::Invalid)?;
-        store.add(i, r.count(float, false)?);
+        store.add(i, r.count(units, false)?);
     }
     Ok(store)
 }
@@ -179,15 +177,20 @@ impl Reader<'_> {
         Ok(f64::from_le_bytes(bytes.try_into().unwrap()))
     }
 
-    /// A bin count must be positive; the zero count may also be 0.
-    fn count(&mut self, float: bool, allow_zero: bool) -> Result<f64, DecodeError> {
-        let c = if float {
-            self.f64()?
+    /// A count in units. A bin count must be positive; the zero count may
+    /// also be 0.
+    fn count(&mut self, units: bool, allow_zero: bool) -> Result<u64, DecodeError> {
+        let v = self.varint()?;
+        let c = if units {
+            v
         } else {
-            self.varint()? as f64
+            v.checked_mul(UNIT).ok_or(DecodeError::Invalid)?
         };
-        let ok = c.is_finite() && (c > 0.0 || (allow_zero && c == 0.0));
-        if ok { Ok(c) } else { Err(DecodeError::Invalid) }
+        if c > 0 || allow_zero {
+            Ok(c)
+        } else {
+            Err(DecodeError::Invalid)
+        }
     }
 
     fn varint(&mut self) -> Result<u64, DecodeError> {
@@ -244,7 +247,13 @@ mod tests {
             frac.add_n(x as f64, 1.0 / 0.3);
         }
         let (w, f) = (whole.to_bytes(), frac.to_bytes());
-        assert!(f.len() > w.len() * 3, "{} vs {}", f.len(), w.len());
+        // 100 bins: about 2 bytes each as whole values, 4 in units.
+        assert!(
+            w.len() < 260 && f.len() < 460,
+            "{} and {}",
+            w.len(),
+            f.len()
+        );
         let (d, _) = DDSketch::decode(&f).unwrap();
         assert_eq!(d.to_bytes(), f);
         assert!((d.count() - 333.33).abs() < 0.01);
