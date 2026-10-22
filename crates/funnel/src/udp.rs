@@ -141,7 +141,9 @@ mod linux {
         pub fn new() -> Self {
             let mut bufs = vec![0u8; SLOTS * MAX_DATAGRAM];
             let mut iovs: Vec<libc::iovec> = bufs
-                .chunks_exact_mut(MAX_DATAGRAM)
+                .as_chunks_mut::<MAX_DATAGRAM>()
+                .0
+                .iter_mut()
                 .map(|slot| libc::iovec {
                     iov_base: slot.as_mut_ptr().cast(),
                     iov_len: slot.len(),

@@ -228,7 +228,7 @@ fn write_profile(path: &std::path::Path, guard: &pprof::ProfilerGuard<'_>) -> an
         *self_time.entry(leaf).or_default() += count;
     }
     let mut top: Vec<_> = self_time.into_iter().collect();
-    top.sort_by(|a, b| b.1.cmp(&a.1));
+    top.sort_by_key(|a| std::cmp::Reverse(a.1));
     let mut out = std::fs::File::create(path.with_extension("txt"))?;
     writeln!(out, "{total} samples; functions by self time")?;
     for (name, n) in top.iter().take(40) {
