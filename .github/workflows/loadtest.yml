@@ -25,14 +25,18 @@ jobs:
       - name: One vCPU
         run: |
           python3 scripts/loadtest.py --cpus 0 --shards 1 --udp-threads 1 \
-            --rates 400000,700000,1000000,1300000,0 --duration 10 | tee one-vcpu.txt
+            --rates 1000000,1500000,2000000,2500000,0 --duration 10 | tee one-vcpu.txt
+      - name: One vCPU, one metric per packet
+        run: |
+          python3 scripts/loadtest.py --cpus 0 --shards 1 --udp-threads 1 --packet-bytes 100 \
+            --rates 200000,400000,600000,0 --duration 10 | tee one-vcpu-small.txt
       - name: All vCPUs
         run: |
           python3 scripts/loadtest.py --shards 2 --udp-threads 2 \
             --rates 400000,600000,800000,0 --duration 10 | tee all-vcpus.txt
       - name: Summary
         run: |
-          { echo "## ${{ matrix.runner }}"; echo '```'; cat machine.txt one-vcpu.txt all-vcpus.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          { echo "## ${{ matrix.runner }}"; echo '```'; cat machine.txt one-vcpu.txt one-vcpu-small.txt all-vcpus.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v4
         with:
           name: loadtest-${{ matrix.runner }}
