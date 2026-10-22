@@ -131,7 +131,8 @@ type Recent = (Kind, Vec<(String, String)>, u64, Value);
 struct Merger<'q> {
     q: &'q Query,
     kind: Option<Kind>,
-    groups: BTreeMap<GroupKey, BTreeMap<u64, Value>>,
+    /// Per group and step: the merged value and the widest bucket in it.
+    groups: BTreeMap<GroupKey, BTreeMap<u64, (Value, u64)>>,
     buckets_read: usize,
 }
 
@@ -149,6 +150,7 @@ impl Merger<'_> {
         &mut self,
         kind: Kind,
         tags: &[(String, String)],
+        width: u64,
         buckets: impl IntoIterator<Item = (u64, Value)>,
     ) -> Result<(), QueryError> {
         match self.kind {
@@ -184,11 +186,14 @@ impl Merger<'_> {
                 return Err(QueryError::TooLarge);
             }
             match steps.get_mut(&(start - start % step)) {
-                Some(acc) => acc
-                    .merge(&value)
-                    .map_err(|_| QueryError::Io("bucket kinds disagree within a series".into()))?,
+                Some((acc, w)) => {
+                    acc.merge(&value).map_err(|_| {
+                        QueryError::Io("bucket kinds disagree within a series".into())
+                    })?;
+                    *w = (*w).max(width);
+                }
                 None => {
-                    steps.insert(start - start % step, value);
+                    steps.insert(start - start % step, (value, width));
                 }
             }
         }
@@ -223,7 +228,7 @@ pub fn run(store: &Store, pending: &Pending, q: &Query) -> Result<QueryResult, Q
                 continue;
             }
             let series = reader.series(entry).map_err(|e| io(&e))?;
-            m.add(entry.kind, &entry.tags, series)?;
+            m.add(entry.kind, &entry.tags, reader.resolution, series)?;
         }
     }
 
@@ -247,7 +252,7 @@ pub fn run(store: &Store, pending: &Pending, q: &Query) -> Result<QueryResult, Q
             .collect()
     };
     for (kind, tags, start, value) in recent {
-        m.add(kind, &tags, [(start, value)])?;
+        m.add(kind, &tags, store.config().bucket_secs, [(start, value)])?;
     }
 
     let agg = match (q.agg, m.kind) {
@@ -265,7 +270,7 @@ pub fn run(store: &Store, pending: &Pending, q: &Query) -> Result<QueryResult, Q
             tags: tags.into_iter().collect(),
             points: steps
                 .into_iter()
-                .filter_map(|(t, v)| value_of(&v, agg, q.step).map(|x| (t, x)))
+                .filter_map(|(t, (v, width))| value_of(&v, agg, q.step.max(width)).map(|x| (t, x)))
                 .collect(),
         })
         .collect();
@@ -294,10 +299,12 @@ fn check_agg(kind: Kind, agg: Agg) -> Result<(), QueryError> {
     }
 }
 
-fn value_of(v: &Value, agg: Agg, step: u64) -> Option<f64> {
+/// `span` is the time a point covers: the step, or the bucket width when
+/// downsampled buckets are wider than the step. Rates divide by it.
+fn value_of(v: &Value, agg: Agg, span: u64) -> Option<f64> {
     match (v, agg) {
         (Value::Counter(c), Agg::Sum) => Some(*c),
-        (Value::Counter(c), Agg::Rate) => Some(*c / step as f64),
+        (Value::Counter(c), Agg::Rate) => Some(*c / span as f64),
         (Value::Gauge(g), Agg::Last) => Some(g.last),
         (Value::Gauge(g), Agg::Min) => Some(g.min),
         (Value::Gauge(g), Agg::Max) => Some(g.max),

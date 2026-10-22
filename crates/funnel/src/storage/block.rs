@@ -37,7 +37,9 @@ use crate::aggregator::{Bucket, Gauge, Value};
 use crate::protocol::Kind;
 
 const MAGIC: &[u8; 4] = b"FNLB";
-const VERSION: u8 = 1;
+const VERSION: u8 = 2;
+/// Bucket width of version-1 blocks, which did not record it.
+const V1_RESOLUTION: u64 = 10;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BlockError {
@@ -83,8 +85,9 @@ impl IndexEntry {
 /// How series are ordered in a block: name, then kind, then tags.
 pub type SeriesOrder = (String, u8, Vec<(String, String)>);
 
-/// Encodes buckets that all belong to `tenant`.
-pub fn encode(tenant: &str, buckets: &[Bucket]) -> Vec<u8> {
+/// Encodes buckets that all belong to `tenant` and are `resolution`
+/// seconds wide.
+pub fn encode(tenant: &str, resolution: u64, buckets: &[Bucket]) -> Vec<u8> {
     let mut by_series: BTreeMap<SeriesOrder, Vec<(u64, &Value)>> = BTreeMap::new();
     for b in buckets {
         debug_assert_eq!(b.series.tenant, tenant);
@@ -95,7 +98,7 @@ pub fn encode(tenant: &str, buckets: &[Bucket]) -> Vec<u8> {
         );
         by_series.entry(key).or_default().push((b.start, &b.value));
     }
-    let mut builder = Builder::new(tenant);
+    let mut builder = Builder::new(tenant, resolution);
     for ((name, _, tags), mut series) in by_series {
         // Stable, so equal starts keep flush order.
         series.sort_by_key(|(start, _)| *start);
@@ -114,11 +117,12 @@ pub struct Builder {
 }
 
 impl Builder {
-    pub fn new(tenant: &str) -> Self {
+    pub fn new(tenant: &str, resolution: u64) -> Self {
         let mut out = Vec::new();
         out.extend_from_slice(MAGIC);
         out.push(VERSION);
         put_str(&mut out, tenant);
+        put_varint(&mut out, resolution);
         Builder {
             out,
             index: Vec::new(),
@@ -154,6 +158,19 @@ impl Builder {
 
     pub fn is_empty(&self) -> bool {
         self.index.is_empty()
+    }
+
+    /// A builder that writes the version-1 header, which has no resolution.
+    #[cfg(test)]
+    fn new_v1(tenant: &str) -> Self {
+        let mut out = Vec::new();
+        out.extend_from_slice(MAGIC);
+        out.push(1);
+        put_str(&mut out, tenant);
+        Builder {
+            out,
+            index: Vec::new(),
+        }
     }
 
     pub fn finish(self) -> Vec<u8> {
@@ -255,6 +272,8 @@ const FULL_SKETCHES: u8 = 1;
 pub struct Reader<'a> {
     bytes: &'a [u8],
     pub tenant: String,
+    /// Width of every bucket in this block, in seconds.
+    pub resolution: u64,
     pub index: Vec<IndexEntry>,
 }
 
@@ -264,11 +283,19 @@ impl<'a> Reader<'a> {
         {
             return Err(BlockError::Magic);
         }
-        if bytes[4] != VERSION {
+        if bytes[4] != VERSION && bytes[4] != 1 {
             return Err(BlockError::Version(bytes[4]));
         }
         let mut header = Cursor::new(bytes, 5);
         let tenant = header.str()?;
+        let resolution = if bytes[4] == 1 {
+            V1_RESOLUTION
+        } else {
+            header.varint()?
+        };
+        if resolution == 0 {
+            return Err(BlockError::Corrupt);
+        }
         let tail = bytes.len() - 12;
         let index_offset = u64::from_le_bytes(bytes[tail..tail + 8].try_into().unwrap()) as usize;
         if index_offset < header.pos || index_offset > tail {
@@ -307,6 +334,7 @@ impl<'a> Reader<'a> {
         Ok(Reader {
             bytes,
             tenant,
+            resolution,
             index,
         })
     }
@@ -547,7 +575,7 @@ mod tests {
     #[test]
     fn roundtrips_every_kind() {
         let input = sample();
-        let bytes = encode("acme", &input);
+        let bytes = encode("acme", 10, &input);
         let r = Reader::open(&bytes).unwrap();
         assert_eq!(r.tenant, "acme");
         assert_eq!(r.index.len(), 4);
@@ -571,7 +599,7 @@ mod tests {
 
     #[test]
     fn find_by_name_and_tag() {
-        let bytes = encode("acme", &sample());
+        let bytes = encode("acme", 10, &sample());
         let r = Reader::open(&bytes).unwrap();
         let req = r.find("http.req");
         assert_eq!(req.len(), 2);
@@ -585,7 +613,7 @@ mod tests {
         // Two partial buckets for the window at 100: the second arrives late.
         let input = buckets(&[(100, "g:1|g"), (120, "g:2|g|T105"), (140, "g:3|g|T107")]);
         assert_eq!(input.len(), 2);
-        let bytes = encode("acme", &input);
+        let bytes = encode("acme", 10, &input);
         let r = Reader::open(&bytes).unwrap();
         let decoded = r.series(&r.index[0]).unwrap();
         assert_eq!(decoded.len(), 2);
@@ -624,7 +652,7 @@ mod tests {
                 value: sketch(0.02, 7.0),
             },
         ];
-        let bytes = encode("acme", &input);
+        let bytes = encode("acme", 10, &input);
         let r = Reader::open(&bytes).unwrap();
         let decoded = r.series(&r.index[0]).unwrap();
         for (b, (start, v)) in input.iter().zip(&decoded) {
@@ -634,9 +662,34 @@ mod tests {
     }
 
     #[test]
+    fn reads_version_1_blocks_as_10_second_buckets() {
+        let input = sample();
+        let mut b = Builder::new_v1("acme");
+        let mut by: BTreeMap<SeriesOrder, Vec<(u64, &Value)>> = BTreeMap::new();
+        for x in &input {
+            let key = (
+                x.series.name.clone(),
+                x.series.kind as u8,
+                x.series.tags.clone(),
+            );
+            by.entry(key).or_default().push((x.start, &x.value));
+        }
+        for ((name, _, tags), series) in &by {
+            b.add_series(name, tags, series);
+        }
+        let bytes = b.finish();
+        let r = Reader::open(&bytes).unwrap();
+        assert_eq!((r.tenant.as_str(), r.resolution), ("acme", 10));
+        let total: usize = r.index.iter().map(|e| r.series(e).unwrap().len()).sum();
+        assert_eq!(total, input.len());
+        let v2 = encode("acme", 60, &input);
+        assert_eq!(Reader::open(&v2).unwrap().resolution, 60);
+    }
+
+    #[test]
     fn rejects_bad_headers() {
         assert_eq!(Reader::open(b"nope").err(), Some(BlockError::Magic));
-        let mut bytes = encode("acme", &sample());
+        let mut bytes = encode("acme", 10, &sample());
         bytes[4] = 9;
         assert_eq!(Reader::open(&bytes).err(), Some(BlockError::Version(9)));
     }
@@ -644,7 +697,7 @@ mod tests {
     proptest! {
         #[test]
         fn corrupted_blocks_never_panic(flips in prop::collection::vec((any::<usize>(), any::<u8>()), 1..8)) {
-            let mut bytes = encode("acme", &sample());
+            let mut bytes = encode("acme", 10, &sample());
             for (i, b) in flips {
                 let i = i % bytes.len();
                 bytes[i] ^= b | 1;

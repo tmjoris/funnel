@@ -18,8 +18,17 @@
 //! - Compaction streams one series at a time across its inputs, so memory
 //!   holds the decompressed inputs and output of one span, not all of a
 //!   tenant's data.
+//! - Older data can be downsampled, e.g. to 1-minute buckets after 7 days
+//!   and 10-minute buckets after 30 (`7d:1m,30d:10m`, the syntax of
+//!   VictoriaMetrics' `-downsampling.period`). Every bucket is a mergeable
+//!   summary, so downsampling merges buckets with the same `Value::merge`
+//!   as everything else: counters stay exact, gauges keep their true min
+//!   and max, and distributions keep their sketches, so percentiles of old
+//!   data stay within the sketch's error. Only time resolution is lost.
+//!   VictoriaMetrics keeps the last sample per interval and Thanos keeps
+//!   count, sum, min and max, so neither keeps percentiles.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -39,8 +48,13 @@ const MANIFEST: &str = "MANIFEST";
 pub struct Config {
     pub dir: PathBuf,
     pub zstd_level: i32,
-    /// Length of the spans compaction merges into one file.
+    /// Width of the buckets new files hold.
+    pub bucket_secs: u64,
+    /// Length of the spans compaction merges into one file at full
+    /// resolution. Downsampled levels use 60 buckets per span.
     pub span_secs: u64,
+    /// Downsampling levels, oldest last; see [`Downsample::parse_list`].
+    pub downsample: Vec<Downsample>,
     /// How long after a span ends before it is compacted, so that buckets
     /// still in flight (flush delay, writer segment) have landed.
     pub settle_secs: u64,
@@ -55,12 +69,67 @@ impl Default for Config {
         Config {
             dir: PathBuf::from("data"),
             zstd_level: 3,
+            bucket_secs: 10,
             span_secs: 600,
+            downsample: Vec::new(),
             settle_secs: 120,
             retention_secs: None,
             delete_after: Duration::from_secs(60),
         }
     }
+}
+
+/// Data older than `after_secs` is kept at `resolution_secs` buckets.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Downsample {
+    pub after_secs: u64,
+    pub resolution_secs: u64,
+}
+
+impl Downsample {
+    /// Parses `7d:1m,30d:10m` (units s, m, h, d).
+    pub fn parse_list(s: &str) -> Result<Vec<Downsample>, String> {
+        fn secs(v: &str) -> Result<u64, String> {
+            let (n, unit) = v.split_at(v.len().saturating_sub(1));
+            let mult = match unit {
+                "s" => 1,
+                "m" => 60,
+                "h" => 3600,
+                "d" => 86_400,
+                _ => return Err(format!("{v:?} needs a unit: s, m, h or d")),
+            };
+            n.parse::<u64>()
+                .ok()
+                .and_then(|n| n.checked_mul(mult))
+                .filter(|&x| x > 0)
+                .ok_or_else(|| format!("bad duration {v:?}"))
+        }
+        s.split(',')
+            .filter(|p| !p.is_empty())
+            .map(|p| {
+                let (after, res) = p
+                    .split_once(':')
+                    .ok_or_else(|| format!("{p:?} should be AGE:RESOLUTION, like 7d:1m"))?;
+                Ok(Downsample {
+                    after_secs: secs(after)?,
+                    resolution_secs: secs(res)?,
+                })
+            })
+            .collect()
+    }
+}
+
+/// A resolution level: data older than `after` (once its span is closed)
+/// is stored in `resolution`-wide buckets, `span` seconds per file.
+#[derive(Clone, Copy, Debug)]
+struct Tier {
+    after: u64,
+    resolution: u64,
+    span: u64,
+}
+
+fn default_resolution() -> u64 {
+    10
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -69,6 +138,10 @@ pub struct FileMeta {
     pub first: u64,
     pub last: u64,
     pub level: u8,
+    /// Bucket width in seconds; manifests from before downsampling hold
+    /// only 10-second buckets.
+    #[serde(default = "default_resolution")]
+    pub resolution: u64,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -85,6 +158,7 @@ pub struct CompactStats {
 
 pub struct Store {
     config: Config,
+    tiers: Vec<Tier>,
     /// Live files per tenant, sorted by first start and then name, which is
     /// write order for files covering the same span.
     tenants: Mutex<HashMap<String, Vec<FileMeta>>>,
@@ -96,6 +170,7 @@ impl Store {
     /// manifest does not list are deleted, and a directory without a
     /// manifest (written before manifests existed) adopts its files.
     pub fn open(config: Config) -> io::Result<Store> {
+        let tiers = tiers(&config).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
         fs::create_dir_all(&config.dir)?;
         let mut tenants = HashMap::new();
         for entry in fs::read_dir(&config.dir)? {
@@ -111,6 +186,7 @@ impl Store {
         }
         Ok(Store {
             config,
+            tiers,
             tenants: Mutex::new(tenants),
             trash: Mutex::new(Vec::new()),
         })
@@ -132,8 +208,9 @@ impl Store {
         }
         let first = buckets.iter().map(|b| b.start).min().unwrap_or(0);
         let last = buckets.iter().map(|b| b.start).max().unwrap_or(0);
-        let (meta, bytes) =
-            self.write_file(tenant, &block::encode(tenant, buckets), first, last, 0)?;
+        let resolution = self.config.bucket_secs;
+        let raw = block::encode(tenant, resolution, buckets);
+        let (meta, bytes) = self.write_file(tenant, &raw, first, last, 0, resolution)?;
         self.commit(tenant, vec![meta], &[])?;
         Ok(bytes)
     }
@@ -167,6 +244,7 @@ impl Store {
         first: u64,
         last: u64,
         level: u8,
+        resolution: u64,
     ) -> io::Result<(FileMeta, usize)> {
         let compressed = zstd::bulk::compress(raw, self.config.zstd_level)?;
         let dir = self.config.dir.join(tenant);
@@ -185,6 +263,7 @@ impl Store {
             first,
             last,
             level,
+            resolution,
         };
         Ok((meta, compressed.len()))
     }
@@ -221,7 +300,6 @@ impl Store {
     }
 
     fn compact_tenant(&self, tenant: &str, now: u64) -> io::Result<CompactStats> {
-        let span = self.config.span_secs;
         let files = self.files(tenant, 0, u64::MAX);
         let mut stats = CompactStats::default();
 
@@ -239,56 +317,84 @@ impl Store {
         }
         let files = self.files(tenant, 0, u64::MAX);
 
-        // Spans that ended at least `settle_secs` ago are closed.
+        // The level of time `t`: the highest one whose span around `t`
+        // ended at least that level's age before `cutoff`. Spans nest (each
+        // level's span is a multiple of the one below), so every time in a
+        // span gets the same level.
         let cutoff = now.saturating_sub(self.config.settle_secs);
-        let closed_end = cutoff - cutoff % span;
-        let span_of = |t: u64| t - t % span;
-        let mut by_span: HashMap<u64, Vec<&FileMeta>> = HashMap::new();
-        for f in files.iter().filter(|f| f.last < closed_end) {
-            let mut s = span_of(f.first);
-            while s <= f.last {
-                by_span.entry(s).or_default().push(f);
-                s += span;
+        let tiers = &self.tiers;
+        let level_of = |t: u64| -> Option<usize> {
+            (0..tiers.len()).rev().find(|&k| {
+                let end = (t - t % tiers[k].span).saturating_add(tiers[k].span);
+                end.saturating_add(tiers[k].after) <= cutoff
+            })
+        };
+        // Only files whose whole range is closed can be inputs: an input
+        // leaves the manifest, so an open part would be lost.
+        let mut groups: BTreeMap<(usize, u64), Vec<&FileMeta>> = BTreeMap::new();
+        for f in files.iter().filter(|f| level_of(f.last).is_some()) {
+            let mut t = f.first;
+            while t <= f.last {
+                let k = level_of(t).expect("older than a closed time");
+                let start = t - t % tiers[k].span;
+                groups.entry((k, start)).or_default().push(f);
+                t = start.saturating_add(tiers[k].span);
+                if t == u64::MAX {
+                    break;
+                }
             }
         }
-        let crosses = |f: &FileMeta| span_of(f.first) != span_of(f.last);
-        let mut dirty: Vec<u64> = by_span
+        // A file reaching outside its span is dirty in every span it
+        // touches, so all of its parts are rewritten in the same pass.
+        let dirty: Vec<(usize, u64)> = groups
             .iter()
-            .filter(|(_, fs)| fs.len() > 1 || fs.iter().any(|f| crosses(f)))
-            .map(|(s, _)| *s)
+            .filter(|((k, start), fs)| {
+                let tier = tiers[*k];
+                fs.len() > 1
+                    || fs.iter().any(|f| {
+                        f.first < *start
+                            || f.last >= start + tier.span
+                            || f.resolution < tier.resolution
+                    })
+            })
+            .map(|(g, _)| *g)
             .collect();
         if dirty.is_empty() {
             return Ok(stats);
         }
-        dirty.sort_unstable();
 
         let mut decompressed: HashMap<String, Vec<u8>> = HashMap::new();
         let mut inputs: BTreeSet<String> = BTreeSet::new();
         let mut outputs = Vec::new();
-        for start in dirty {
-            let span_files = &by_span[&start];
-            for f in span_files {
+        for (n, group) in dirty.iter().enumerate() {
+            let (k, start) = *group;
+            let tier = tiers[k];
+            let group_files = &groups[group];
+            for f in group_files {
                 if !decompressed.contains_key(&f.name) {
                     decompressed.insert(f.name.clone(), self.read(tenant, f)?);
                 }
                 inputs.insert(f.name.clone());
             }
-            let readers = span_files
+            let readers = group_files
                 .iter()
                 .map(|f| Reader::open(&decompressed[&f.name]))
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-            let raw = merge_span(tenant, &readers, start, start + span)
+            let merged = merge_span(tenant, &readers, start, start + tier.span, tier.resolution)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-            if let Some((raw, first, last)) = raw {
-                let (meta, _) = self.write_file(tenant, &raw, first, last, 1)?;
+            if let Some((raw, first, last)) = merged {
+                let level = u8::try_from(k + 1).unwrap_or(u8::MAX);
+                let (meta, _) =
+                    self.write_file(tenant, &raw, first, last, level, tier.resolution)?;
                 outputs.push(meta);
             }
-            // Free inputs that no later dirty span needs.
+            // Free inputs no later dirty span needs.
+            let later = &dirty[n + 1..];
             decompressed.retain(|name, _| {
-                files
+                later
                     .iter()
-                    .any(|f| &f.name == name && f.last >= start + span)
+                    .any(|g| groups[g].iter().any(|f| &f.name == name))
             });
         }
         let inputs: Vec<String> = inputs.into_iter().collect();
@@ -326,14 +432,48 @@ impl Store {
     }
 }
 
+/// The levels in use: full resolution, then each downsampling level.
+fn tiers(config: &Config) -> Result<Vec<Tier>, String> {
+    if config.bucket_secs == 0 || !config.span_secs.is_multiple_of(config.bucket_secs) {
+        return Err("span_secs must be a multiple of bucket_secs".into());
+    }
+    let mut tiers = vec![Tier {
+        after: 0,
+        resolution: config.bucket_secs,
+        span: config.span_secs,
+    }];
+    for d in &config.downsample {
+        let prev = tiers[tiers.len() - 1];
+        let tier = Tier {
+            after: d.after_secs,
+            resolution: d.resolution_secs,
+            span: d.resolution_secs * 60,
+        };
+        if tier.after <= prev.after
+            || tier.resolution <= prev.resolution
+            || !tier.resolution.is_multiple_of(prev.resolution)
+            || !tier.span.is_multiple_of(prev.span)
+        {
+            return Err(format!(
+                "downsampling levels must grow in age and resolution, each a multiple \
+                 of the one before (60x a resolution must be a multiple of {}s)",
+                prev.span
+            ));
+        }
+        tiers.push(tier);
+    }
+    Ok(tiers)
+}
+
 /// Merges every series found in `readers` (oldest file first) restricted to
-/// `[from, to)`. Returns the raw block and its time range, or `None` if the
-/// span holds no buckets.
+/// `[from, to)`, into buckets `resolution` seconds wide. Returns the raw
+/// block and its time range, or `None` if the span holds no buckets.
 fn merge_span(
     tenant: &str,
     readers: &[Reader<'_>],
     from: u64,
     to: u64,
+    resolution: u64,
 ) -> Result<Option<(Vec<u8>, u64, u64)>, block::BlockError> {
     let mut keys: BTreeSet<block::SeriesOrder> = BTreeSet::new();
     for r in readers {
@@ -341,7 +481,7 @@ fn merge_span(
             keys.insert((e.name.clone(), e.kind as u8, e.tags.clone()));
         }
     }
-    let mut builder = Builder::new(tenant);
+    let mut builder = Builder::new(tenant, resolution);
     let (mut first, mut last) = (u64::MAX, 0);
     for (name, kind, tags) in keys {
         let kind = match kind {
@@ -355,7 +495,8 @@ fn merge_span(
                 series.extend(
                     r.series(e)?
                         .into_iter()
-                        .filter(|(s, _)| *s >= from && *s < to),
+                        .filter(|(s, _)| *s >= from && *s < to)
+                        .map(|(s, v)| (s - s % resolution, v)),
                 );
             }
         }
@@ -456,6 +597,7 @@ fn parse_name(name: &str) -> Option<FileMeta> {
         first,
         last,
         level,
+        resolution: default_resolution(),
     })
 }
 
@@ -584,7 +726,7 @@ mod tests {
         // A crash after writing an output but before committing it, and a
         // temporary file from an interrupted write.
         let (orphan, _) = s
-            .write_file("acme", &block::encode("acme", &[]), 1, 2, 1)
+            .write_file("acme", &block::encode("acme", 10, &[]), 1, 2, 1, 10)
             .unwrap();
         fs::write(dir.join("acme").join(".x.tmp"), b"partial").unwrap();
         drop(s);
@@ -600,7 +742,7 @@ mod tests {
     fn adopts_files_written_before_manifests() {
         let dir = temp_dir("adopt");
         fs::create_dir_all(dir.join("acme")).unwrap();
-        let raw = block::encode("acme", &buckets(&[(1000, "req:7|c")]));
+        let raw = block::encode("acme", 10, &buckets(&[(1000, "req:7|c")]));
         let old = dir.join("acme").join(format!("1000-1000-123.{EXTENSION}"));
         fs::write(&old, zstd::bulk::compress(&raw, 3).unwrap()).unwrap();
         let s = store(&dir);
@@ -623,6 +765,172 @@ mod tests {
         s.add("acme", &buckets(&[(9000, "req:1|c")])).unwrap();
         assert_eq!(s.compact(9100).unwrap().expired, 1);
         assert_eq!(s.files("acme", 0, u64::MAX).len(), 1);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn downsample_levels_parse_and_validate() {
+        let levels = Downsample::parse_list("7d:1m,30d:10m").unwrap();
+        assert_eq!(
+            levels,
+            [
+                Downsample {
+                    after_secs: 7 * 86_400,
+                    resolution_secs: 60
+                },
+                Downsample {
+                    after_secs: 30 * 86_400,
+                    resolution_secs: 600
+                },
+            ]
+        );
+        for bad in ["7d", "7x:1m", "0d:1m", "7d:", "d:1m"] {
+            assert!(Downsample::parse_list(bad).is_err(), "{bad}");
+        }
+        let open = |downsample: &str| {
+            Store::open(Config {
+                dir: temp_dir("levels"),
+                downsample: Downsample::parse_list(downsample).unwrap(),
+                ..Config::default()
+            })
+        };
+        // Ages must grow, resolutions must be multiples, spans must nest.
+        assert!(open("30d:1m,7d:10m").is_err());
+        assert!(open("7d:1m,30d:90s").is_err());
+        assert!(open("7d:15s").is_err());
+        assert!(open("7d:1m,30d:10m").is_ok());
+    }
+
+    fn downsampling_store(dir: &Path) -> Store {
+        Store::open(Config {
+            dir: dir.to_path_buf(),
+            span_secs: 60,
+            settle_secs: 0,
+            delete_after: Duration::ZERO,
+            // After 600 s, 60-second buckets in 3600-second files.
+            downsample: vec![Downsample {
+                after_secs: 600,
+                resolution_secs: 60,
+            }],
+            ..Config::default()
+        })
+        .unwrap()
+    }
+
+    /// Writes 60 windows from 1000 to 1590 as three level-0 files.
+    fn sixty_windows(s: &Store) {
+        let lines: Vec<(u64, String)> = (0..60u64)
+            .flat_map(|i| {
+                let t = 1000 + i * 10;
+                [
+                    (t, "req:1|c".to_string()),
+                    (t, format!("g:{}|g|T{}", (i * 7) % 50, t + 3)),
+                    (t, format!("lat:{}|ms", 10 + i % 20)),
+                ]
+            })
+            .collect();
+        for chunk in lines.chunks(60) {
+            let refs: Vec<(u64, &str)> = chunk.iter().map(|(t, l)| (*t, l.as_str())).collect();
+            s.add("acme", &buckets(&refs)).unwrap();
+        }
+    }
+
+    fn values(s: &Store, name: &str) -> Vec<(u64, Value)> {
+        let mut out = Vec::new();
+        for f in s.files("acme", 0, u64::MAX) {
+            let bytes = s.read("acme", &f).unwrap();
+            let r = Reader::open(&bytes).unwrap();
+            for e in r.find(name) {
+                out.extend(r.series(e).unwrap());
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn downsampling_merges_buckets_exactly() {
+        let dir = temp_dir("downsample");
+        let s = downsampling_store(&dir);
+        sixty_windows(&s);
+
+        // Not yet old enough: compaction keeps 10-second buckets.
+        s.compact(3600 + 599).unwrap();
+        assert!(
+            s.files("acme", 0, u64::MAX)
+                .iter()
+                .all(|f| f.resolution == 10)
+        );
+        assert_eq!(values(&s, "req").len(), 60);
+
+        // Old enough: one file of 60-second buckets.
+        s.compact(3600 + 600).unwrap();
+        let files = s.files("acme", 0, u64::MAX);
+        assert_eq!(files.len(), 1);
+        assert_eq!((files[0].resolution, files[0].level), (60, 2));
+
+        let req = values(&s, "req");
+        assert!(req.iter().all(|(start, _)| start % 60 == 0));
+        assert_eq!(req.len(), 11, "1000..1590 touches minutes 960 to 1560");
+        let total: f64 = req
+            .iter()
+            .map(|(_, v)| match v {
+                Value::Counter(c) => *c,
+                _ => 0.0,
+            })
+            .sum();
+        assert_eq!(total, 60.0);
+
+        let gauges: Vec<_> = values(&s, "g")
+            .into_iter()
+            .map(|(_, v)| match v {
+                Value::Gauge(g) => g,
+                _ => panic!(),
+            })
+            .collect();
+        let min = gauges.iter().map(|g| g.min).fold(f64::INFINITY, f64::min);
+        let max = gauges
+            .iter()
+            .map(|g| g.max)
+            .fold(f64::NEG_INFINITY, f64::max);
+        let count: u64 = gauges.iter().map(|g| g.count).sum();
+        assert_eq!((min, max, count), (0.0, 49.0, 60));
+        // The last bucket's last value is the last one sent (i = 59).
+        assert_eq!(gauges.last().unwrap().last, ((59 * 7) % 50) as f64);
+
+        let lat: f64 = values(&s, "lat")
+            .iter()
+            .map(|(_, v)| match v {
+                Value::Distribution(d) => d.count(),
+                _ => 0.0,
+            })
+            .sum();
+        assert_eq!(lat, 60.0);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn rates_over_downsampled_buckets_use_their_width() {
+        use crate::query::{Agg, Query, run};
+        use crate::storage::writer::Pending;
+
+        let dir = temp_dir("rate");
+        let s = downsampling_store(&dir);
+        sixty_windows(&s);
+        s.compact(3600 + 600).unwrap();
+        let q = Query {
+            tenant: "acme".into(),
+            metric: "req".into(),
+            from: 0,
+            to: u64::MAX,
+            filters: vec![],
+            group_by: Some(vec![]),
+            step: 10,
+            agg: Some(Agg::Rate),
+        };
+        let r = run(&s, &Pending::default(), &q).unwrap();
+        // A full minute holds 6 requests: 0.1 per second, not 0.6.
+        let full_minute = r.series[0].points.iter().find(|(t, _)| *t == 1020).unwrap();
+        assert!((full_minute.1 - 0.1).abs() < 1e-9, "{full_minute:?}");
         fs::remove_dir_all(&dir).unwrap();
     }
 

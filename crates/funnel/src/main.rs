@@ -52,6 +52,11 @@ struct Args {
     /// flight have landed.
     #[arg(long, env = "FUNNEL_SETTLE_SECS", default_value_t = 120)]
     settle_secs: u64,
+    /// Downsample older data, e.g. `7d:1m,30d:10m`: 1-minute buckets after 7
+    /// days, 10-minute after 30. Sums, extremes and sketches are kept, so
+    /// old percentiles stay accurate; only time resolution is lost.
+    #[arg(long, env = "FUNNEL_DOWNSAMPLE", value_parser = store::Downsample::parse_list)]
+    downsample: Option<Vec<store::Downsample>>,
     /// Delete data older than this many days; keep everything if unset.
     #[arg(long, env = "FUNNEL_RETENTION_DAYS")]
     retention_days: Option<u64>,
@@ -121,7 +126,9 @@ async fn main() -> anyhow::Result<()> {
 
     let store = Arc::new(Store::open(store::Config {
         dir: args.data_dir.clone(),
+        bucket_secs: aggregator::Config::default().bucket_secs,
         span_secs: args.span_secs,
+        downsample: args.downsample.clone().unwrap_or_default(),
         settle_secs: args.settle_secs,
         retention_secs: args.retention_days.map(|d| d * 86_400),
         ..store::Config::default()
