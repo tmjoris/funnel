@@ -55,8 +55,8 @@ struct Args {
     /// Downsample older data, e.g. `7d:1m,30d:10m`: 1-minute buckets after 7
     /// days, 10-minute after 30. Sums, extremes and sketches are kept, so
     /// old percentiles stay accurate; only time resolution is lost.
-    #[arg(long, env = "FUNNEL_DOWNSAMPLE", value_parser = store::Downsample::parse_list)]
-    downsample: Option<Vec<store::Downsample>>,
+    #[arg(long, env = "FUNNEL_DOWNSAMPLE", value_parser = parse_levels)]
+    downsample: Option<Levels>,
     /// Delete data older than this many days; keep everything if unset.
     #[arg(long, env = "FUNNEL_RETENTION_DAYS")]
     retention_days: Option<u64>,
@@ -66,6 +66,15 @@ struct Args {
     #[cfg(feature = "profile")]
     #[arg(long)]
     profile: Option<std::path::PathBuf>,
+}
+
+/// Downsampling levels as one flag value. A bare `Vec` would make clap
+/// expect one level per value and fail when the parser returns the list.
+#[derive(Clone, Debug)]
+struct Levels(Vec<store::Downsample>);
+
+fn parse_levels(s: &str) -> Result<Levels, String> {
+    store::Downsample::parse_list(s).map(Levels)
 }
 
 #[tokio::main]
@@ -128,7 +137,7 @@ async fn main() -> anyhow::Result<()> {
         dir: args.data_dir.clone(),
         bucket_secs: aggregator::Config::default().bucket_secs,
         span_secs: args.span_secs,
-        downsample: args.downsample.clone().unwrap_or_default(),
+        downsample: args.downsample.clone().map(|l| l.0).unwrap_or_default(),
         settle_secs: args.settle_secs,
         retention_secs: args.retention_days.map(|d| d * 86_400),
         ..store::Config::default()
@@ -243,4 +252,20 @@ fn write_profile(path: &std::path::Path, guard: &pprof::ProfilerGuard<'_>) -> an
     }
     tracing::info!(path = %path.display(), samples = total, "wrote profile");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    #[test]
+    fn command_lines_parse() {
+        Args::command().debug_assert();
+        let args = Args::try_parse_from(["funnel", "--downsample", "7d:1m,30d:10m"]).unwrap();
+        assert_eq!(args.downsample.unwrap().0.len(), 2);
+        assert!(Args::try_parse_from(["funnel", "--downsample", "7d:1x"]).is_err());
+        let args = Args::try_parse_from(["funnel", "--retention-days", "30"]).unwrap();
+        assert_eq!(args.retention_days, Some(30));
+    }
 }
