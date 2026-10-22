@@ -52,7 +52,7 @@ def run(rate, args):
     data = tempfile.mkdtemp(prefix="funnel-load-")
     pin = ["taskset", "-c", args.cpus] if args.cpus else []
     server = subprocess.Popen(
-        pin + [FUNNEL, "--udp", "127.0.0.1:18125", "--http", "127.0.0.1:18080",
+        pin + [args.funnel, "--udp", "127.0.0.1:18125", "--http", "127.0.0.1:18080",
          "--shards", str(args.shards), "--udp-threads", str(args.udp_threads),
          "--data-dir", data],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -76,7 +76,8 @@ def run(rate, args):
         t0 = time.time()
         out = subprocess.run(
             [LOADGEN, "--udp", "127.0.0.1:18125", "--rate", str(rate),
-             "--duration", str(args.duration), "--threads", str(args.senders)],
+             "--duration", str(args.duration), "--threads", str(args.senders),
+             "--packet-bytes", str(args.packet_bytes)],
             capture_output=True, text=True, check=True).stdout
         # Let queued batches drain before reading counters.
         time.sleep(2)
@@ -112,6 +113,9 @@ def main():
     p.add_argument("--shards", type=int, default=2)
     p.add_argument("--udp-threads", type=int, default=2)
     p.add_argument("--senders", type=int, default=2)
+    p.add_argument("--funnel", default=FUNNEL, help="server binary, to compare builds")
+    p.add_argument("--packet-bytes", type=int, default=1432,
+                   help="largest UDP payload loadgen sends; small values model one metric per packet")
     p.add_argument("--cpus", default="",
                    help="pin the server to these CPUs with taskset, e.g. 0 to model a 1-vCPU server")
     args = p.parse_args()
