@@ -8,7 +8,7 @@
 use std::collections::{HashMap, HashSet};
 use std::hash::{BuildHasherDefault, Hasher};
 
-use xxhash_rust::xxh3::Xxh3;
+use xxhash_rust::xxh3::xxh3_64;
 
 use crate::protocol::{Kind, Line};
 
@@ -51,21 +51,32 @@ pub fn normalize_tags(tags: &mut Vec<(&str, &str)>) {
 }
 
 /// Hashes a series from borrowed parts. `tags` must be normalized.
+///
+/// The parts are copied into a reused per-thread buffer and hashed in one
+/// call: xxh3's streaming API pays a fixed cost on every `update`, and a
+/// series key is a dozen tiny pieces, which made streaming the single
+/// largest cost in the ingest profile. One-shot hashing of the same bytes
+/// gives the same id.
 pub fn series_id(tenant: &str, name: &str, kind: Kind, tags: &[(&str, &str)]) -> SeriesId {
-    let mut h = Xxh3::new();
-    // Field separators keep ("ab", "c") and ("a", "bc") apart; none of the
-    // parts can contain \0 or \x01 after protocol validation.
-    h.update(tenant.as_bytes());
-    h.update(b"\0");
-    h.update(name.as_bytes());
-    h.update(&[0, kind as u8]);
-    for (k, v) in tags {
-        h.update(k.as_bytes());
-        h.update(b"\x01");
-        h.update(v.as_bytes());
-        h.update(b"\0");
+    thread_local! {
+        static KEY: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
     }
-    SeriesId(h.digest())
+    KEY.with_borrow_mut(|key| {
+        key.clear();
+        // Field separators keep ("ab", "c") and ("a", "bc") apart; none of
+        // the parts can contain \0 or \x01 after protocol validation.
+        key.extend_from_slice(tenant.as_bytes());
+        key.push(0);
+        key.extend_from_slice(name.as_bytes());
+        key.extend_from_slice(&[0, kind as u8]);
+        for (k, v) in tags {
+            key.extend_from_slice(k.as_bytes());
+            key.push(1);
+            key.extend_from_slice(v.as_bytes());
+            key.push(0);
+        }
+        SeriesId(xxh3_64(key))
+    })
 }
 
 impl SeriesKey {
@@ -109,6 +120,27 @@ mod tests {
         let mut l = parse_line(line).unwrap();
         normalize_tags(&mut l.tags);
         series_id(tenant, l.name, l.kind, &l.tags)
+    }
+
+    #[test]
+    fn one_shot_matches_streaming_hash() {
+        let mut h = xxhash_rust::xxh3::Xxh3::new();
+        for part in [
+            &b"t"[..],
+            b"\0",
+            b"a",
+            &[0, Kind::Gauge as u8],
+            b"k",
+            b"\x01",
+            b"v",
+            b"\0",
+        ] {
+            h.update(part);
+        }
+        assert_eq!(
+            series_id("t", "a", Kind::Gauge, &[("k", "v")]),
+            SeriesId(h.digest())
+        );
     }
 
     #[test]
