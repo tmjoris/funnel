@@ -25,7 +25,7 @@ jobs:
       - name: One vCPU
         run: |
           python3 scripts/loadtest.py --cpus 0 --shards 1 --udp-threads 1 \
-            --rates 100000,200000,300000,400000,0 --duration 10 | tee one-vcpu.txt
+            --rates 400000,700000,1000000,1300000,0 --duration 10 | tee one-vcpu.txt
       - name: All vCPUs
         run: |
           python3 scripts/loadtest.py --shards 2 --udp-threads 2 \
