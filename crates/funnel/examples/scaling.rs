@@ -12,7 +12,11 @@ fn main() {
     let minutes: u64 = args.next().map_or(2, |m| m.parse().unwrap());
     let rates: Vec<f64> = {
         let r: Vec<f64> = args.map(|r| r.parse().unwrap()).collect();
-        if r.is_empty() { vec![50.0, 500.0, 2000.0] } else { r }
+        if r.is_empty() {
+            vec![50.0, 500.0, 2000.0]
+        } else {
+            r
+        }
     };
     println!(
         "{:>12} {:>12} {:>8} {:>9} {:>11} {:>9} {:>10} {:>14}",
@@ -35,7 +39,8 @@ fn main() {
             let now = workload.next_second(&mut lines);
             points += lines.len() as u64;
             for line in &lines {
-                agg.insert(now, "default", &mut parse_line(line).unwrap()).unwrap();
+                agg.insert(now, "default", &mut parse_line(line).unwrap())
+                    .unwrap();
             }
             buckets.extend(agg.flush(now));
             lines.clear();
@@ -44,8 +49,11 @@ fn main() {
         let mut series: Vec<_> = buckets.iter().map(|b| b.series.clone()).collect();
         series.sort_by(|a, b| (&a.name, &a.tags).cmp(&(&b.name, &b.tags)));
         series.dedup();
-        let bytes = zstd::bulk::compress(&block::encode("default", &buckets), 3).unwrap().len();
-        let per_series_year = bytes as f64 / series.len() as f64 * (365.0 * 24.0 * 60.0 / minutes as f64);
+        let bytes = zstd::bulk::compress(&block::encode("default", &buckets), 3)
+            .unwrap()
+            .len();
+        let per_series_year =
+            bytes as f64 / series.len() as f64 * (365.0 * 24.0 * 60.0 / minutes as f64);
         println!(
             "{rate:>12} {points:>12} {:>8} {:>9} {bytes:>11} {:>9.1} {:>10.3} {:>14.2}",
             series.len(),
