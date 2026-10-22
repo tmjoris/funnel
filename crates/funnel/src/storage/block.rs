@@ -80,11 +80,12 @@ impl IndexEntry {
     }
 }
 
-type SeriesOrder = (String, u8, Vec<(String, String)>);
+/// How series are ordered in a block: name, then kind, then tags.
+pub type SeriesOrder = (String, u8, Vec<(String, String)>);
 
 /// Encodes buckets that all belong to `tenant`.
 pub fn encode(tenant: &str, buckets: &[Bucket]) -> Vec<u8> {
-    let mut by_series: BTreeMap<SeriesOrder, Vec<&Bucket>> = BTreeMap::new();
+    let mut by_series: BTreeMap<SeriesOrder, Vec<(u64, &Value)>> = BTreeMap::new();
     for b in buckets {
         debug_assert_eq!(b.series.tenant, tenant);
         let key = (
@@ -92,61 +93,101 @@ pub fn encode(tenant: &str, buckets: &[Bucket]) -> Vec<u8> {
             b.series.kind as u8,
             b.series.tags.clone(),
         );
-        by_series.entry(key).or_default().push(b);
+        by_series.entry(key).or_default().push((b.start, &b.value));
+    }
+    let mut builder = Builder::new(tenant);
+    for ((name, _, tags), mut series) in by_series {
+        // Stable, so equal starts keep flush order.
+        series.sort_by_key(|(start, _)| *start);
+        builder.add_series(&name, &tags, &series);
+    }
+    builder.finish()
+}
+
+/// Writes a block one series at a time, so a block can be built without
+/// holding all of its buckets in memory. Series must be added in index
+/// order (name, then kind, then tags), each with its buckets sorted by
+/// start.
+pub struct Builder {
+    out: Vec<u8>,
+    index: Vec<IndexEntry>,
+}
+
+impl Builder {
+    pub fn new(tenant: &str) -> Self {
+        let mut out = Vec::new();
+        out.extend_from_slice(MAGIC);
+        out.push(VERSION);
+        put_str(&mut out, tenant);
+        Builder {
+            out,
+            index: Vec::new(),
+        }
     }
 
-    let mut out = Vec::new();
-    out.extend_from_slice(MAGIC);
-    out.push(VERSION);
-    put_str(&mut out, tenant);
-
-    let mut index = Vec::with_capacity(by_series.len());
-    for ((name, kind, tags), mut series) in by_series {
-        // Stable, so equal starts keep flush order.
-        series.sort_by_key(|b| b.start);
-        let offset = out.len();
-        encode_series(&series, &mut out);
-        index.push(IndexEntry {
-            name,
-            kind: kind_from(kind).expect("kind of a real bucket"),
-            tags,
+    pub fn add_series(&mut self, name: &str, tags: &[(String, String)], series: &[(u64, &Value)]) {
+        let Some(first) = series.first() else {
+            return;
+        };
+        let kind = first.1.kind();
+        if let Some(prev) = self.index.last() {
+            let order =
+                |n: &str, k: Kind, t: &[(String, String)]| (n.to_owned(), k as u8, t.to_vec());
+            debug_assert!(
+                order(&prev.name, prev.kind, &prev.tags) < order(name, kind, tags),
+                "series added out of order"
+            );
+        }
+        let offset = self.out.len();
+        encode_series(series, &mut self.out);
+        self.index.push(IndexEntry {
+            name: name.to_owned(),
+            kind,
+            tags: tags.to_vec(),
             buckets: series.len(),
-            first: series[0].start,
-            last: series[series.len() - 1].start,
+            first: first.0,
+            last: series[series.len() - 1].0,
             offset,
-            len: out.len() - offset,
+            len: self.out.len() - offset,
         });
     }
 
-    let index_offset = out.len();
-    put_varint(&mut out, index.len() as u64);
-    for e in &index {
-        put_str(&mut out, &e.name);
-        out.push(e.kind as u8);
-        put_varint(&mut out, e.tags.len() as u64);
-        for (k, v) in &e.tags {
-            put_str(&mut out, k);
-            put_str(&mut out, v);
-        }
-        put_varint(&mut out, e.buckets as u64);
-        put_varint(&mut out, e.first);
-        put_varint(&mut out, e.last - e.first);
-        put_varint(&mut out, e.offset as u64);
-        put_varint(&mut out, e.len as u64);
+    pub fn is_empty(&self) -> bool {
+        self.index.is_empty()
     }
-    out.extend_from_slice(&(index_offset as u64).to_le_bytes());
-    out.extend_from_slice(MAGIC);
-    out
+
+    pub fn finish(self) -> Vec<u8> {
+        let Builder { mut out, index } = self;
+        let index_offset = out.len();
+        put_varint(&mut out, index.len() as u64);
+        for e in &index {
+            put_str(&mut out, &e.name);
+            out.push(e.kind as u8);
+            put_varint(&mut out, e.tags.len() as u64);
+            for (k, v) in &e.tags {
+                put_str(&mut out, k);
+                put_str(&mut out, v);
+            }
+            put_varint(&mut out, e.buckets as u64);
+            put_varint(&mut out, e.first);
+            put_varint(&mut out, e.last - e.first);
+            put_varint(&mut out, e.offset as u64);
+            put_varint(&mut out, e.len as u64);
+        }
+        out.extend_from_slice(&(index_offset as u64).to_le_bytes());
+        out.extend_from_slice(MAGIC);
+        out
+    }
 }
 
-fn encode_series(series: &[&Bucket], out: &mut Vec<u8>) {
-    let starts: Vec<u64> = series.iter().map(|b| b.start).collect();
+fn encode_series(series: &[(u64, &Value)], out: &mut Vec<u8>) {
+    let starts: Vec<u64> = series.iter().map(|b| b.0).collect();
     put_bytes(out, &encode_times(&starts));
     let column = |out: &mut Vec<u8>, f: &dyn Fn(&Value) -> f64| {
-        let values: Vec<f64> = series.iter().map(|b| f(&b.value)).collect();
+        let values: Vec<f64> = series.iter().map(|b| f(b.1)).collect();
         put_bytes(out, &encode_floats(&values));
     };
-    match series[0].value.kind() {
+    match series[0].1.kind() {
         Kind::Counter => column(out, &|v| match v {
             Value::Counter(c) => *c,
             _ => unreachable!("one kind per series"),
@@ -154,8 +195,8 @@ fn encode_series(series: &[&Bucket], out: &mut Vec<u8>) {
         Kind::Gauge => {
             let gauges: Vec<(u64, &Gauge)> = series
                 .iter()
-                .map(|b| match &b.value {
-                    Value::Gauge(g) => (b.start, g),
+                .map(|b| match b.1 {
+                    Value::Gauge(g) => (b.0, g),
                     _ => unreachable!("one kind per series"),
                 })
                 .collect();
@@ -176,7 +217,7 @@ fn encode_series(series: &[&Bucket], out: &mut Vec<u8>) {
         Kind::Distribution => {
             let sketches: Vec<&DDSketch> = series
                 .iter()
-                .map(|b| match &b.value {
+                .map(|b| match b.1 {
                     Value::Distribution(s) => &**s,
                     _ => unreachable!("one kind per series"),
                 })
@@ -273,6 +314,18 @@ impl<'a> Reader<'a> {
     /// Bytes of data stored for one series.
     pub fn series_len(&self, entry: &IndexEntry) -> usize {
         entry.len
+    }
+
+    /// The index entry for one exact series, if this block has it.
+    pub fn find_exact(
+        &self,
+        name: &str,
+        kind: Kind,
+        tags: &[(String, String)],
+    ) -> Option<&IndexEntry> {
+        self.find(name)
+            .iter()
+            .find(|e| e.kind == kind && e.tags == tags)
     }
 
     /// Index entries for one metric name.
