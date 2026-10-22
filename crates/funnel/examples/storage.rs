@@ -191,7 +191,7 @@ fn rollup_rows(buckets: &[Bucket]) -> Row {
 
 fn gorilla(buckets: &[Bucket]) -> (Row, Vec<u8>) {
     let t = Instant::now();
-    let bytes = block::encode("default", buckets);
+    let bytes = block::encode("default", 10, buckets);
     let encode_ms = t.elapsed().as_secs_f64() * 1e3;
     let t = Instant::now();
     let reader = block::Reader::open(&bytes).unwrap();

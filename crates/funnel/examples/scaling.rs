@@ -49,7 +49,7 @@ fn main() {
         let mut series: Vec<_> = buckets.iter().map(|b| b.series.clone()).collect();
         series.sort_by(|a, b| (&a.name, &a.tags).cmp(&(&b.name, &b.tags)));
         series.dedup();
-        let bytes = zstd::bulk::compress(&block::encode("default", &buckets), 3)
+        let bytes = zstd::bulk::compress(&block::encode("default", 10, &buckets), 3)
             .unwrap()
             .len();
         let per_series_year =

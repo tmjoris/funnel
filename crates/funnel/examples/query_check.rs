@@ -2,7 +2,10 @@
 //! path and prints percentiles, to compare with exact answers computed from
 //! the raw points elsewhere (e.g. ClickHouse's quantileExact).
 //!
-//!     cargo run --release -p funnel --example query_check -- 10 /r3
+//!     cargo run --release -p funnel --example query_check -- 10 /r3 [resolution]
+//!
+//! With a resolution in seconds, everything is downsampled to it first;
+//! sketches merge exactly, so whole-range percentiles must not change.
 
 use funnel::aggregator::{Aggregator, Config};
 use funnel::protocol::parse_line;
@@ -13,10 +16,19 @@ use funnel::storage::writer::Pending;
 fn main() {
     let minutes: u64 = std::env::args().nth(1).map_or(10, |m| m.parse().unwrap());
     let route = std::env::args().nth(2).unwrap_or_else(|| "/r3".into());
+    let resolution: Option<u64> = std::env::args().nth(3).map(|r| r.parse().unwrap());
     let dir = std::env::temp_dir().join(format!("funnel-query-check-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     let store = Store::open(StoreConfig {
         dir: dir.clone(),
+        downsample: resolution
+            .map(|r| {
+                vec![funnel::storage::store::Downsample {
+                    after_secs: 1,
+                    resolution_secs: r,
+                }]
+            })
+            .unwrap_or_default(),
         ..StoreConfig::default()
     })
     .unwrap();
@@ -38,7 +50,7 @@ fn main() {
         }
     }
     store.add("default", &agg.flush_all()).unwrap();
-    store.compact(start + minutes * 60 + 3600).unwrap();
+    store.compact(start + minutes * 60 + 86_400).unwrap();
 
     for q in [0.5, 0.99, 0.999] {
         let result = run(
