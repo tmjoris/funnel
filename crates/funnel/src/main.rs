@@ -8,6 +8,7 @@ use funnel::aggregator::Bucket;
 use funnel::http::{self, AppState};
 use funnel::router::Router;
 use funnel::stats::Stats;
+use funnel::storage::store::{self, Store};
 use funnel::storage::writer;
 use funnel::{aggregator, limiter, shard, udp};
 
@@ -38,8 +39,22 @@ struct Args {
     data_dir: std::path::PathBuf,
     /// Seconds of rollups held in memory before they are written; a crash
     /// loses at most this much.
-    #[arg(long, env = "FUNNEL_SEGMENT_SECS", default_value_t = 60)]
+    #[arg(long, env = "FUNNEL_SEGMENT_SECS", default_value_t = 5)]
     segment_secs: u64,
+    /// Seconds between early flushes of open windows as partial buckets;
+    /// 0 waits for each window to close. Bounds crash loss and query lag.
+    #[arg(long, env = "FUNNEL_CHECKPOINT_SECS", default_value_t = 5)]
+    checkpoint_secs: u64,
+    /// Seconds of data compaction merges into one file.
+    #[arg(long, env = "FUNNEL_SPAN_SECS", default_value_t = 600)]
+    span_secs: u64,
+    /// Seconds after a span ends before it is compacted, so buckets still in
+    /// flight have landed.
+    #[arg(long, env = "FUNNEL_SETTLE_SECS", default_value_t = 120)]
+    settle_secs: u64,
+    /// Delete data older than this many days; keep everything if unset.
+    #[arg(long, env = "FUNNEL_RETENTION_DAYS")]
+    retention_days: Option<u64>,
 }
 
 #[tokio::main]
@@ -71,6 +86,8 @@ async fn main() -> anyhow::Result<()> {
             ..limiter::Config::default()
         },
         flush_every: Duration::from_secs(1),
+        checkpoint_every: (args.checkpoint_secs > 0)
+            .then(|| Duration::from_secs(args.checkpoint_secs)),
     };
     let budgets = Arc::new(limiter::Budgets::default());
     let shards: Vec<_> = (0..shards)
@@ -88,13 +105,19 @@ async fn main() -> anyhow::Result<()> {
         .collect();
     drop(bucket_tx);
 
+    let store = Arc::new(Store::open(store::Config {
+        dir: args.data_dir.clone(),
+        span_secs: args.span_secs,
+        settle_secs: args.settle_secs,
+        retention_secs: args.retention_days.map(|d| d * 86_400),
+        ..store::Config::default()
+    })?);
+    let pending = writer::Pending::default();
     let writer = writer::spawn(
-        writer::Config {
-            dir: args.data_dir.clone(),
-            segment: Duration::from_secs(args.segment_secs),
-            ..writer::Config::default()
-        },
+        store.clone(),
+        Duration::from_secs(args.segment_secs),
         bucket_rx,
+        pending.clone(),
         stats.clone(),
     );
 
@@ -104,6 +127,28 @@ async fn main() -> anyhow::Result<()> {
     ));
     let tenant: Arc<str> = args.default_tenant.into();
     let stop = Arc::new(AtomicBool::new(false));
+    let compactor = {
+        let (store, stop, stats) = (store.clone(), stop.clone(), stats.clone());
+        std::thread::Builder::new()
+            .name("compactor".into())
+            .spawn(move || {
+                let mut last = std::time::Instant::now();
+                while !stop.load(Ordering::Relaxed) {
+                    std::thread::sleep(Duration::from_millis(500));
+                    if last.elapsed() < Duration::from_secs(30) {
+                        continue;
+                    }
+                    last = std::time::Instant::now();
+                    match store.compact(funnel::unix_now()) {
+                        Ok(s) => {
+                            Stats::add(&stats.files_compacted, s.inputs as u64);
+                            Stats::add(&stats.files_expired, s.expired as u64);
+                        }
+                        Err(e) => tracing::error!("compaction: {e}"),
+                    }
+                }
+            })?
+    };
     let (udp_addr, udp_threads) = udp::spawn(
         args.udp,
         args.udp_threads,
@@ -118,7 +163,8 @@ async fn main() -> anyhow::Result<()> {
         router: router.clone(),
         reports,
         default_tenant: tenant,
-        data_dir: Arc::new(args.data_dir.clone()),
+        store: store.clone(),
+        pending: pending.clone(),
     });
     axum::serve(listener, app)
         .with_graceful_shutdown(async {
@@ -139,6 +185,7 @@ async fn main() -> anyhow::Result<()> {
         let _ = s.handle.join();
     }
     let _ = writer.join();
+    let _ = compactor.join();
     tracing::info!(stats = ?stats.snapshot(), "stopped");
     Ok(())
 }

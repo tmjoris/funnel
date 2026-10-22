@@ -7,17 +7,20 @@
 //! stored as mergeable sketches: the p99 across 100 hosts comes from merging
 //! their sketches, which averaging 100 per-host p99s cannot reproduce.
 //!
-//! Only data already written to disk is visible, so the newest minute or so
-//! (one writer segment plus the flush delay) is missing from results.
+//! Results include buckets the writer has not written yet. Windows the
+//! aggregator is still filling (at most a bucket width plus the grace
+//! period, 15 seconds by default) are not visible: a 10-second summary does
+//! not exist until its window closes.
 
 use std::collections::BTreeMap;
-use std::path::Path;
 
 use serde::Serialize;
 
 use crate::aggregator::Value;
 use crate::protocol::Kind;
-use crate::storage::{block, writer};
+use crate::storage::block;
+use crate::storage::store::Store;
+use crate::storage::writer::Pending;
 
 /// Upper bound on buckets one query may decode, to keep a single request
 /// from monopolising the server.
@@ -121,88 +124,142 @@ fn kind_name(kind: Kind) -> &'static str {
 }
 
 type GroupKey = Vec<(String, String)>;
+/// A pending bucket copied out under the lock: kind, tags, start, value.
+type Recent = (Kind, Vec<(String, String)>, u64, Value);
 
-pub fn run(dir: &Path, q: &Query) -> Result<QueryResult, QueryError> {
+/// Collects matching buckets into groups and steps, merging as it goes.
+struct Merger<'q> {
+    q: &'q Query,
+    kind: Option<Kind>,
+    groups: BTreeMap<GroupKey, BTreeMap<u64, Value>>,
+    buckets_read: usize,
+}
+
+impl Merger<'_> {
+    fn matches(&self, tag: impl Fn(&str) -> Option<String>) -> bool {
+        self.q
+            .filters
+            .iter()
+            .all(|(k, v)| tag(k).as_deref() == Some(v.as_str()))
+    }
+
+    /// Adds one series' buckets; callers pass sources oldest first, which
+    /// is the order gauge merges expect.
+    fn add(
+        &mut self,
+        kind: Kind,
+        tags: &[(String, String)],
+        buckets: impl IntoIterator<Item = (u64, Value)>,
+    ) -> Result<(), QueryError> {
+        match self.kind {
+            None => self.kind = Some(kind),
+            Some(k) if k != kind => {
+                return Err(QueryError::BadRequest(format!(
+                    "{} is stored as both {} and {}",
+                    self.q.metric,
+                    kind_name(k),
+                    kind_name(kind)
+                )));
+            }
+            Some(_) => {}
+        }
+        let key: GroupKey = match &self.q.group_by {
+            None => tags.to_vec(),
+            Some(by) => by
+                .iter()
+                .map(|t| {
+                    let v = tags.iter().find(|(k, _)| k == t).map_or("", |(_, v)| v);
+                    (t.clone(), v.to_owned())
+                })
+                .collect(),
+        };
+        let (from, to, step) = (self.q.from, self.q.to, self.q.step);
+        let steps = self.groups.entry(key).or_default();
+        for (start, value) in buckets {
+            if start < from || start > to {
+                continue;
+            }
+            self.buckets_read += 1;
+            if self.buckets_read > MAX_BUCKETS {
+                return Err(QueryError::TooLarge);
+            }
+            match steps.get_mut(&(start - start % step)) {
+                Some(acc) => acc
+                    .merge(&value)
+                    .map_err(|_| QueryError::Io("bucket kinds disagree within a series".into()))?,
+                None => {
+                    steps.insert(start - start % step, value);
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Runs a query over the tenant's files and its buckets not yet written.
+pub fn run(store: &Store, pending: &Pending, q: &Query) -> Result<QueryResult, QueryError> {
     if q.step == 0 || q.from > q.to {
         return Err(QueryError::BadRequest(
             "need step > 0 and from <= to".into(),
         ));
     }
-    let files =
-        writer::list(dir, &q.tenant, q.from, q.to).map_err(|e| QueryError::Io(e.to_string()))?;
-    let mut kind: Option<Kind> = None;
-    let mut groups: BTreeMap<GroupKey, BTreeMap<u64, Value>> = BTreeMap::new();
-    let mut buckets_read = 0;
+    let io = |e: &dyn std::fmt::Display| QueryError::Io(e.to_string());
+    let mut m = Merger {
+        q,
+        kind: None,
+        groups: BTreeMap::new(),
+        buckets_read: 0,
+    };
 
+    let files = store.files(&q.tenant, q.from, q.to);
     for file in &files {
-        let bytes = writer::read(&file.path).map_err(|e| QueryError::Io(e.to_string()))?;
-        let reader = block::Reader::open(&bytes).map_err(|e| QueryError::Io(e.to_string()))?;
+        let bytes = store.read(&q.tenant, file).map_err(|e| io(&e))?;
+        let reader = block::Reader::open(&bytes).map_err(|e| io(&e))?;
         for entry in reader.find(&q.metric) {
             if entry.last < q.from || entry.first > q.to {
                 continue;
             }
-            if !q
-                .filters
-                .iter()
-                .all(|(k, v)| entry.tag(k) == Some(v.as_str()))
-            {
+            if !m.matches(|k| entry.tag(k).map(str::to_owned)) {
                 continue;
             }
-            match kind {
-                None => kind = Some(entry.kind),
-                Some(k) if k != entry.kind => {
-                    return Err(QueryError::BadRequest(format!(
-                        "{} is stored as both {} and {}",
-                        q.metric,
-                        kind_name(k),
-                        kind_name(entry.kind)
-                    )));
-                }
-                Some(_) => {}
-            }
-            buckets_read += entry.buckets;
-            if buckets_read > MAX_BUCKETS {
-                return Err(QueryError::TooLarge);
-            }
-            let key: GroupKey = match &q.group_by {
-                None => entry.tags.clone(),
-                Some(by) => by
-                    .iter()
-                    .map(|t| (t.clone(), entry.tag(t).unwrap_or("").to_owned()))
-                    .collect(),
-            };
-            let steps = groups.entry(key).or_default();
-            let series = reader
-                .series(entry)
-                .map_err(|e| QueryError::Io(e.to_string()))?;
-            for (start, value) in series {
-                if start < q.from || start > q.to {
-                    continue;
-                }
-                let step = start - start % q.step;
-                match steps.get_mut(&step) {
-                    // Files are read oldest first and buckets in flush order,
-                    // which is the order gauge merges expect.
-                    Some(acc) => acc.merge(&value).map_err(|_| {
-                        QueryError::Io("bucket kinds disagree within a series".into())
-                    })?,
-                    None => {
-                        steps.insert(step, value);
-                    }
-                }
-            }
+            let series = reader.series(entry).map_err(|e| io(&e))?;
+            m.add(entry.kind, &entry.tags, series)?;
         }
     }
 
-    let agg = match (q.agg, kind) {
+    // Newest last: buckets flushed but not yet in a committed file.
+    let recent: Vec<Recent> = {
+        let pending = pending.lock().unwrap();
+        pending
+            .get(&q.tenant)
+            .into_iter()
+            .flatten()
+            .filter(|b| b.series.name == q.metric && b.start >= q.from && b.start <= q.to)
+            .filter(|b| m.matches(|k| b.series.tag(k).map(str::to_owned)))
+            .map(|b| {
+                (
+                    b.series.kind,
+                    b.series.tags.clone(),
+                    b.start,
+                    b.value.clone(),
+                )
+            })
+            .collect()
+    };
+    for (kind, tags, start, value) in recent {
+        m.add(kind, &tags, [(start, value)])?;
+    }
+
+    let agg = match (q.agg, m.kind) {
         (Some(a), _) => a,
         (None, Some(k)) => Agg::default_for(k),
         (None, None) => Agg::Sum,
     };
-    if let Some(k) = kind {
+    if let Some(k) = m.kind {
         check_agg(k, agg)?;
     }
-    let series = groups
+    let series = m
+        .groups
         .into_iter()
         .map(|(tags, steps)| Series {
             tags: tags.into_iter().collect(),
@@ -214,10 +271,10 @@ pub fn run(dir: &Path, q: &Query) -> Result<QueryResult, QueryError> {
         .collect();
     Ok(QueryResult {
         metric: q.metric.clone(),
-        kind: kind.map(kind_name),
+        kind: m.kind.map(kind_name),
         series,
         files_read: files.len(),
-        buckets_read,
+        buckets_read: m.buckets_read,
     })
 }
 
@@ -261,7 +318,8 @@ mod tests {
     use super::*;
     use crate::aggregator::{Aggregator, Config as AggConfig};
     use crate::protocol::parse_line;
-    use crate::storage::writer::{Config as WriterConfig, write_block};
+    use crate::storage::store::Config as StoreConfig;
+    use std::path::Path;
     use std::path::PathBuf;
 
     fn temp_dir(name: &str) -> PathBuf {
@@ -270,18 +328,26 @@ mod tests {
         dir
     }
 
-    /// Writes one block per call, like one writer segment.
+    fn open(dir: &Path) -> Store {
+        Store::open(StoreConfig {
+            dir: dir.to_path_buf(),
+            ..StoreConfig::default()
+        })
+        .unwrap()
+    }
+
+    /// Writes one level-0 file per call, like one writer segment.
     fn segment(dir: &Path, lines: &[(u64, String)]) {
         let mut agg = Aggregator::new(AggConfig::default());
         for (now, line) in lines {
             agg.insert(*now, "acme", &mut parse_line(line).unwrap())
                 .unwrap();
         }
-        let config = WriterConfig {
-            dir: dir.to_path_buf(),
-            ..WriterConfig::default()
-        };
-        write_block(&config, "acme", &agg.flush_all()).unwrap();
+        open(dir).add("acme", &agg.flush_all()).unwrap();
+    }
+
+    fn run_dir(dir: &Path, q: &Query) -> Result<QueryResult, QueryError> {
+        run(&open(dir), &Pending::default(), q)
     }
 
     fn query(metric: &str) -> Query {
@@ -326,7 +392,7 @@ mod tests {
     #[test]
     fn per_series_counters_merge_partial_buckets() {
         let dir = setup("partial");
-        let r = run(
+        let r = run_dir(
             &dir,
             &Query {
                 filters: vec![("host".into(), "a".into())],
@@ -351,7 +417,7 @@ mod tests {
             agg: Some(Agg::Rate),
             ..query("req")
         };
-        let r = run(&dir, &q).unwrap();
+        let r = run_dir(&dir, &q).unwrap();
         assert_eq!(r.series.len(), 1);
         // Steps start at multiples of 60: [960, 1020) holds the windows at
         // 1000 and 1010 (2 hosts * 2 windows * 2, plus the late 5) and
@@ -372,7 +438,7 @@ mod tests {
             agg: Some(Agg::Quantile(0.9)),
             ..query("lat")
         };
-        let r = run(&dir, &q).unwrap();
+        let r = run_dir(&dir, &q).unwrap();
         // Half the values are 10, half 1000: p90 is about 1000, while
         // averaging the two hosts' p90s would give about 505.
         let p90 = r.series[0].points[0].1;
@@ -383,7 +449,7 @@ mod tests {
     #[test]
     fn group_by_tag_and_gauges() {
         let dir = setup("gauge");
-        let r = run(
+        let r = run_dir(
             &dir,
             &Query {
                 group_by: Some(vec!["host".into()]),
@@ -393,7 +459,7 @@ mod tests {
         .unwrap();
         assert_eq!(r.series.len(), 2);
         assert_eq!(r.series[0].tags.get("host").map(String::as_str), Some("a"));
-        let g = run(
+        let g = run_dir(
             &dir,
             &Query {
                 step: 60,
@@ -407,9 +473,35 @@ mod tests {
     }
 
     #[test]
+    fn pending_buckets_are_visible_and_merge_with_files() {
+        let dir = setup("pending");
+        let store = open(&dir);
+        let pending = Pending::default();
+        let mut agg = Aggregator::new(AggConfig::default());
+        agg.insert(
+            1200,
+            "acme",
+            &mut parse_line("req:4|c|#host:a,route:/x|T1005").unwrap(),
+        )
+        .unwrap();
+        pending
+            .lock()
+            .unwrap()
+            .insert("acme".into(), agg.flush_all());
+        let q = Query {
+            filters: vec![("host".into(), "a".into())],
+            ..query("req")
+        };
+        let r = run(&store, &pending, &q).unwrap();
+        // 2 + the late 5 from files, plus 4 still pending.
+        assert_eq!(r.series[0].points[0], (1000, 11.0));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn time_range_and_errors() {
         let dir = setup("errors");
-        let r = run(
+        let r = run_dir(
             &dir,
             &Query {
                 from: 1020,
@@ -423,8 +515,8 @@ mod tests {
                 .iter()
                 .all(|s| s.points.iter().all(|(t, _)| (1020..=1030).contains(t)))
         );
-        assert!(run(&dir, &query("missing")).unwrap().series.is_empty());
-        let bad = run(
+        assert!(run_dir(&dir, &query("missing")).unwrap().series.is_empty());
+        let bad = run_dir(
             &dir,
             &Query {
                 agg: Some(Agg::Quantile(0.5)),
@@ -433,7 +525,7 @@ mod tests {
         );
         assert!(matches!(bad, Err(QueryError::BadRequest(_))));
         assert!(
-            run(
+            run_dir(
                 &dir,
                 &Query {
                     step: 0,

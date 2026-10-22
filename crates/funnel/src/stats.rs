@@ -42,6 +42,8 @@ counters!(
     blocks_written,
     bytes_written,
     buckets_lost_write,
+    files_compacted,
+    files_expired,
 );
 
 impl Stats {

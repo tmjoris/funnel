@@ -16,6 +16,8 @@ use crate::query::{self, Agg, Query, QueryError};
 use crate::router::Router;
 use crate::shard::Reports;
 use crate::stats::Snapshot;
+use crate::storage::store::Store;
+use crate::storage::writer::Pending;
 use crate::unix_now;
 
 pub const TENANT_HEADER: &str = "x-funnel-tenant";
@@ -25,7 +27,8 @@ pub struct AppState {
     pub router: Arc<Router>,
     pub reports: Reports,
     pub default_tenant: Arc<str>,
-    pub data_dir: Arc<std::path::PathBuf>,
+    pub store: Arc<Store>,
+    pub pending: Pending,
 }
 
 pub fn app(state: AppState) -> Http {
@@ -166,8 +169,8 @@ async fn query_handler(
         step: p.step.unwrap_or(10),
         agg,
     };
-    let dir = state.data_dir.clone();
-    match tokio::task::spawn_blocking(move || query::run(&dir, &q)).await {
+    let (store, pending) = (state.store.clone(), state.pending.clone());
+    match tokio::task::spawn_blocking(move || query::run(&store, &pending, &q)).await {
         Ok(Ok(result)) => Json(result).into_response(),
         Ok(Err(QueryError::BadRequest(m))) => bad(&m),
         Ok(Err(e @ QueryError::TooLarge)) => {

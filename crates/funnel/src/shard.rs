@@ -27,6 +27,12 @@ pub struct Config {
     pub aggregator: aggregator::Config,
     pub limiter: limiter::Config,
     pub flush_every: Duration,
+    /// How often every open window is flushed early as a partial bucket.
+    /// Windows the aggregator still holds are lost in a crash and invisible
+    /// to queries, so this bounds both. Readers and compaction merge the
+    /// partial buckets, which every aggregate here allows. `None` waits for
+    /// windows to close.
+    pub checkpoint_every: Option<Duration>,
 }
 
 pub struct Shard {
@@ -85,6 +91,7 @@ fn run(
 ) {
     let mut agg = Aggregator::new(config.aggregator);
     let mut next_flush = Instant::now() + config.flush_every;
+    let mut next_checkpoint = config.checkpoint_every.map(|c| Instant::now() + c);
     loop {
         match rx.recv_deadline(next_flush) {
             Ok(batch) => process(&batch, &mut agg, &mut limiter, &stats),
@@ -95,7 +102,13 @@ fn run(
             next_flush += config.flush_every;
             let now = unix_now();
             limiter.tick(now);
-            let buckets = agg.flush(now);
+            let buckets = match (next_checkpoint, config.checkpoint_every) {
+                (Some(at), Some(every)) if Instant::now() >= at => {
+                    next_checkpoint = Some(at + every);
+                    agg.flush_all()
+                }
+                _ => agg.flush(now),
+            };
             reports.lock().unwrap()[index] = report(&agg, &limiter);
             if !buckets.is_empty() && out.send(buckets).is_err() {
                 return;
