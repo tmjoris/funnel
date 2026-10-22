@@ -33,3 +33,6 @@ zstd = "0.13"
 [features]
 # Sampling CPU profiler behind `--profile`; needs no root or perf.
 profile = ["dep:pprof"]
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2.191"

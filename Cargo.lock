@@ -744,6 +744,7 @@ dependencies = [
  "clap",
  "crossbeam-channel",
  "funnel-sketch",
+ "libc",
  "loadgen",
  "parquet",
  "pprof",
