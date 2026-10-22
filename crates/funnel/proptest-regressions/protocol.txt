@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc c5856f0130e2e5ef28f8f0c9d501d3995d8a2daf4415c6765a92cd4773b4f792 # shrinks to base = "lat:12.5:30|ms|@0.25|#route:/users,env:prod,canary|T1761000000", edits = [(Index(0), "T", true), (Index(10376293541461622784), "|", true)]

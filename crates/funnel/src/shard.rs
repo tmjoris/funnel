@@ -9,7 +9,7 @@ use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
 
 use crate::aggregator::{self, Aggregator, Bucket, Reject};
 use crate::limiter::{self, Budgets, Limiter, TenantReport};
-use crate::protocol::{parse_line, parse_line_without_tags, take_tenant};
+use crate::protocol::{Line, parse_into, parse_line, take_tenant};
 use crate::series::{SeriesId, SeriesKey, normalize_tags};
 use crate::stats::Stats;
 use crate::unix_now;
@@ -133,14 +133,15 @@ fn run(
 /// Applies one batch to a shard's aggregator and limiter. Public for benchmarks.
 pub fn process(batch: &Batch, agg: &mut Aggregator, limiter: &mut Limiter, stats: &Stats) {
     let (mut accepted, mut cardinality, mut too_old, mut future, mut overflow) = (0, 0, 0, 0, 0);
+    let mut line = Line::default();
     for item in &batch.items {
         let raw = &batch.text[item.offset as usize..][..item.len as usize];
         let tenant: &str = &batch.tenants[item.tenant as usize];
         let id = SeriesId(item.id);
         // The router already validated these lines.
-        let Ok(line) = parse_line_without_tags(raw) else {
+        if parse_into(raw, false, &mut line).is_err() {
             continue;
-        };
+        }
         // Time checks come first so that a point about to be rejected does
         // not claim a series slot.
         if let Err(reject) = agg.check_time(batch.now, &line) {

@@ -66,9 +66,24 @@ impl std::error::Error for ParseError {}
 pub const MAX_NAME_LEN: usize = 200;
 pub const MAX_TAGS: usize = 32;
 
+impl Default for Line<'_> {
+    fn default() -> Self {
+        Line {
+            name: "",
+            kind: Kind::Counter,
+            values: Vec::new(),
+            sample_rate: 1.0,
+            tags: Vec::new(),
+            timestamp: None,
+        }
+    }
+}
+
 /// Parses one line. Trailing `\r` and surrounding whitespace are ignored.
 pub fn parse_line(line: &str) -> Result<Line<'_>, ParseError> {
-    parse(line, true)
+    let mut out = Line::default();
+    parse_into(line, true, &mut out)?;
+    Ok(out)
 }
 
 /// Parses a line that has already been validated by [`parse_line`], but
@@ -76,70 +91,120 @@ pub fn parse_line(line: &str) -> Result<Line<'_>, ParseError> {
 /// the router has already parsed the tags to compute the series id, and
 /// the shard needs them again only for a series it has not seen.
 pub fn parse_line_without_tags(line: &str) -> Result<Line<'_>, ParseError> {
-    parse(line, false)
+    let mut out = Line::default();
+    parse_into(line, false, &mut out)?;
+    Ok(out)
 }
 
-fn parse(line: &str, with_tags: bool) -> Result<Line<'_>, ParseError> {
+/// Index of the first `byte` in `b` at or after `from`, or `b.len()`.
+#[inline]
+fn find(b: &[u8], from: usize, byte: u8) -> usize {
+    b[from..]
+        .iter()
+        .position(|&c| c == byte)
+        .map_or(b.len(), |p| from + p)
+}
+
+/// Parses `line` into `out`, reusing its buffers, which is what the hot
+/// paths do to avoid two allocations per line.
+///
+/// One pass over the bytes finds every separator. The first version split
+/// the line with `str::split` and `split_once` a dozen times per line, and
+/// each call's setup cost on a few bytes made parsing the largest cost in
+/// the ingest profile. Behavior, including which error a bad line reports,
+/// is checked against that version by a property test.
+pub fn parse_into<'a>(
+    line: &'a str,
+    with_tags: bool,
+    out: &mut Line<'a>,
+) -> Result<(), ParseError> {
+    out.values.clear();
+    out.tags.clear();
+    out.sample_rate = 1.0;
+    out.timestamp = None;
     let line = line.trim();
     if line.is_empty() {
         return Err(ParseError::Empty);
     }
-    let mut sections = line.split('|');
-    let head = sections.next().ok_or(ParseError::Empty)?;
-    let (name, raw_values) = head.split_once(':').ok_or(ParseError::Value)?;
-    if !valid_name(name) {
+    let b = line.as_bytes();
+    let head_end = find(b, 0, b'|');
+    let colon = find(&b[..head_end], 0, b':');
+    if colon == head_end {
+        return Err(ParseError::Value);
+    }
+    out.name = &line[..colon];
+    if !valid_name(out.name) {
         return Err(ParseError::Name);
     }
-    let kind = match sections.next() {
-        Some("c") => Kind::Counter,
-        Some("g") => Kind::Gauge,
-        Some("d" | "ms" | "h") => Kind::Distribution,
-        Some("s") => return Err(ParseError::UnsupportedSet),
+    if head_end == b.len() {
+        return Err(ParseError::Type);
+    }
+    let type_end = find(b, head_end + 1, b'|');
+    out.kind = match &b[head_end + 1..type_end] {
+        b"c" => Kind::Counter,
+        b"g" => Kind::Gauge,
+        b"d" | b"ms" | b"h" => Kind::Distribution,
+        b"s" => return Err(ParseError::UnsupportedSet),
         _ => return Err(ParseError::Type),
     };
-    let values = raw_values
-        .split(':')
-        .map(|v| match v.parse::<f64>() {
-            Ok(x) if x.is_finite() => Ok(x),
-            _ => Err(ParseError::Value),
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+    let mut start = colon + 1;
+    loop {
+        let end = find(&b[..head_end], start, b':');
+        match line[start..end].parse::<f64>() {
+            Ok(x) if x.is_finite() => out.values.push(x),
+            _ => return Err(ParseError::Value),
+        }
+        if end == head_end {
+            break;
+        }
+        start = end + 1;
+    }
 
-    let mut parsed = Line {
-        name,
-        kind,
-        values,
-        sample_rate: 1.0,
-        tags: Vec::new(),
-        timestamp: None,
-    };
-    for section in sections {
-        if let Some(rate) = section.strip_prefix('@') {
-            parsed.sample_rate = match rate.parse::<f64>() {
-                Ok(r) if r > 0.0 && r <= 1.0 => r,
-                _ => return Err(ParseError::SampleRate),
-            };
-        } else if let Some(tags) = section.strip_prefix('#') {
-            if !with_tags {
-                continue;
+    let mut bar = type_end;
+    while bar < b.len() {
+        let start = bar + 1;
+        let end = find(b, start, b'|');
+        bar = end;
+        let section = &line[start..end];
+        match section.as_bytes().first() {
+            Some(b'@') => {
+                out.sample_rate = match section[1..].parse::<f64>() {
+                    Ok(r) if r > 0.0 && r <= 1.0 => r,
+                    _ => return Err(ParseError::SampleRate),
+                };
             }
-            for tag in tags.split(',').filter(|t| !t.is_empty()) {
-                let (k, v) = tag.split_once(':').unwrap_or((tag, ""));
-                if !valid_name(k) || !valid_tag_value(v) {
+            Some(b'#') if !with_tags => {}
+            Some(b'#') => {
+                let tags = &section[1..];
+                let tb = tags.as_bytes();
+                let mut t = 0;
+                while t <= tb.len() {
+                    let comma = find(tb, t, b',');
+                    if comma > t {
+                        let colon = find(&tb[..comma], t, b':');
+                        let (k, v) = if colon == comma {
+                            (&tags[t..comma], "")
+                        } else {
+                            (&tags[t..colon], &tags[colon + 1..comma])
+                        };
+                        if !valid_name(k) || !valid_tag_value(v) {
+                            return Err(ParseError::Tag);
+                        }
+                        out.tags.push((k, v));
+                    }
+                    t = comma + 1;
+                }
+                if out.tags.len() > MAX_TAGS {
                     return Err(ParseError::Tag);
                 }
-                parsed.tags.push((k, v));
             }
-            if parsed.tags.len() > MAX_TAGS {
-                return Err(ParseError::Tag);
+            Some(b'T') => {
+                out.timestamp = Some(section[1..].parse().map_err(|_| ParseError::Timestamp)?);
             }
-        } else if let Some(ts) = section.strip_prefix('T') {
-            parsed.timestamp = Some(ts.parse().map_err(|_| ParseError::Timestamp)?);
-        } else {
-            return Err(ParseError::UnknownSection);
+            _ => return Err(ParseError::UnknownSection),
         }
     }
-    Ok(parsed)
+    Ok(())
 }
 
 /// Tag that selects the tenant on protocols without their own way to say it
@@ -182,6 +247,170 @@ fn valid_tag_value(s: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
+
+    /// The first, `str::split`-based parser, kept as the reference the
+    /// byte-level parser must agree with.
+    fn reference(line: &str, with_tags: bool) -> Result<Line<'_>, ParseError> {
+        let line = line.trim();
+        if line.is_empty() {
+            return Err(ParseError::Empty);
+        }
+        let mut sections = line.split('|');
+        let head = sections.next().ok_or(ParseError::Empty)?;
+        let (name, raw_values) = head.split_once(':').ok_or(ParseError::Value)?;
+        if !valid_name(name) {
+            return Err(ParseError::Name);
+        }
+        let kind = match sections.next() {
+            Some("c") => Kind::Counter,
+            Some("g") => Kind::Gauge,
+            Some("d" | "ms" | "h") => Kind::Distribution,
+            Some("s") => return Err(ParseError::UnsupportedSet),
+            _ => return Err(ParseError::Type),
+        };
+        let values = raw_values
+            .split(':')
+            .map(|v| match v.parse::<f64>() {
+                Ok(x) if x.is_finite() => Ok(x),
+                _ => Err(ParseError::Value),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let mut parsed = Line {
+            name,
+            kind,
+            values,
+            sample_rate: 1.0,
+            tags: Vec::new(),
+            timestamp: None,
+        };
+        for section in sections {
+            if let Some(rate) = section.strip_prefix('@') {
+                parsed.sample_rate = match rate.parse::<f64>() {
+                    Ok(r) if r > 0.0 && r <= 1.0 => r,
+                    _ => return Err(ParseError::SampleRate),
+                };
+            } else if let Some(tags) = section.strip_prefix('#') {
+                if !with_tags {
+                    continue;
+                }
+                for tag in tags.split(',').filter(|t| !t.is_empty()) {
+                    let (k, v) = tag.split_once(':').unwrap_or((tag, ""));
+                    if !valid_name(k) || !valid_tag_value(v) {
+                        return Err(ParseError::Tag);
+                    }
+                    parsed.tags.push((k, v));
+                }
+                if parsed.tags.len() > MAX_TAGS {
+                    return Err(ParseError::Tag);
+                }
+            } else if let Some(ts) = section.strip_prefix('T') {
+                parsed.timestamp = Some(ts.parse().map_err(|_| ParseError::Timestamp)?);
+            } else {
+                return Err(ParseError::UnknownSection);
+            }
+        }
+        Ok(parsed)
+    }
+
+    fn agree(line: &str) -> Result<(), TestCaseError> {
+        for with_tags in [true, false] {
+            let mut out = Line::default();
+            // Reuse a dirty buffer, as the hot paths do.
+            parse_into("old:9:9|g|@0.5|#x:y|T5", true, &mut out).unwrap();
+            let fast = parse_into(line, with_tags, &mut out).map(|()| out);
+            prop_assert_eq!(
+                fast,
+                reference(line, with_tags),
+                "{:?} tags={}",
+                line,
+                with_tags
+            );
+        }
+        Ok(())
+    }
+
+    const PIECES: &[&str] = &[
+        "a",
+        "b.c",
+        "-",
+        "/",
+        "_",
+        ":",
+        "::",
+        "|",
+        "||",
+        "#",
+        ",",
+        ",,",
+        "@",
+        "T",
+        "1",
+        "2.5",
+        "-3",
+        "1e3",
+        "0.5",
+        "1.5",
+        "0",
+        "NaN",
+        "inf",
+        "c",
+        "g",
+        "ms",
+        "d",
+        "h",
+        "s",
+        "x",
+        " ",
+        "\r",
+        "\t",
+        "é",
+        "\u{a0}",
+        "k:v",
+        "tenant",
+        "1761000000",
+    ];
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(4096))]
+
+        #[test]
+        fn byte_parser_matches_reference_on_arbitrary_lines(
+            parts in prop::collection::vec(prop::sample::select(PIECES), 0..24),
+        ) {
+            agree(&parts.concat())?;
+        }
+
+        #[test]
+        fn byte_parser_matches_reference_on_mutated_valid_lines(
+            base in prop::sample::select(&[
+                "http.req:1|c|#route:/a,status:2xx",
+                "lat:12.5:30|ms|@0.25|#route:/users,env:prod,canary|T1761000000",
+                "q:-3|g",
+                "d:1|d|#a:b|@1|T0",
+            ][..]),
+            edits in prop::collection::vec((any::<prop::sample::Index>(), prop::sample::select(PIECES), any::<bool>()), 0..4),
+        ) {
+            let mut line = base.to_string();
+            for (at, piece, insert) in edits {
+                let mut i = at.index(line.len() + 1);
+                while !line.is_char_boundary(i) {
+                    i -= 1;
+                }
+                if insert {
+                    line.insert_str(i, piece);
+                } else if i < line.len() {
+                    let mut j = i + 1;
+                    while !line.is_char_boundary(j) {
+                        j += 1;
+                    }
+                    line.replace_range(i..j, "");
+                }
+            }
+            agree(&line)?;
+        }
+    }
 
     #[test]
     fn counter() {

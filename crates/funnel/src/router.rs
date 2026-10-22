@@ -6,7 +6,7 @@ use std::sync::Arc;
 use crossbeam_channel::{Sender, TrySendError};
 use serde::Serialize;
 
-use crate::protocol::{parse_line, take_tenant};
+use crate::protocol::{Line, parse_into, take_tenant};
 use crate::series::{normalize_tags, series_id};
 use crate::shard::{Batch, Item};
 use crate::stats::Stats;
@@ -44,15 +44,16 @@ impl Router {
     pub fn route(&self, now: u64, default_tenant: &Arc<str>, text: &str) -> Routed {
         let mut pending: Vec<Option<Batch>> = (0..self.shards.len()).map(|_| None).collect();
         let mut routed = Routed::default();
+        let mut line = Line::default();
         for raw in text.lines() {
             if raw.trim().is_empty() {
                 continue;
             }
             routed.lines += 1;
-            let Ok(mut line) = parse_line(raw) else {
+            if parse_into(raw, true, &mut line).is_err() {
                 routed.parse_errors += 1;
                 continue;
-            };
+            }
             let tenant = match take_tenant(&mut line) {
                 Ok(t) => t.unwrap_or(default_tenant),
                 Err(_) => {
