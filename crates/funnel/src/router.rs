@@ -8,7 +8,7 @@ use serde::Serialize;
 
 use crate::protocol::{parse_line, take_tenant};
 use crate::series::{normalize_tags, series_id};
-use crate::shard::Batch;
+use crate::shard::{Batch, Item};
 use crate::stats::Stats;
 
 pub struct Router {
@@ -64,17 +64,30 @@ impl Router {
             let id = series_id(tenant, line.name, line.kind, &line.tags);
             let batch = pending[self.shard_of(id.0)].get_or_insert_with(|| Batch {
                 now,
-                default_tenant: default_tenant.clone(),
+                tenants: vec![default_tenant.clone()],
                 text: String::with_capacity(text.len() / self.shards.len() + 64),
-                lines: 0,
+                items: Vec::new(),
+            });
+            // Most batches hold one tenant, so a short scan beats a map.
+            let tenant = match batch.tenants.iter().position(|t| &**t == tenant) {
+                Some(i) => i,
+                None => {
+                    batch.tenants.push(Arc::from(tenant));
+                    batch.tenants.len() - 1
+                }
+            };
+            batch.items.push(Item {
+                offset: batch.text.len() as u32,
+                len: raw.len() as u32,
+                id: id.0,
+                tenant: tenant as u32,
             });
             batch.text.push_str(raw);
             batch.text.push('\n');
-            batch.lines += 1;
         }
         for (shard, batch) in self.shards.iter().zip(pending) {
             let Some(batch) = batch else { continue };
-            let lines = batch.lines;
+            let lines = batch.items.len() as u64;
             match shard.try_send(batch) {
                 Ok(()) => {}
                 Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) => {
@@ -113,7 +126,7 @@ mod tests {
                 .iter()
                 .any(|b| b.text.contains("a:1|c|#x:1\na:2|c|#x:1\n"))
         );
-        assert_eq!(batches.iter().map(|b| b.lines).sum::<u64>(), 3);
+        assert_eq!(batches.iter().map(|b| b.items.len()).sum::<usize>(), 3);
 
         // Queues hold one batch; the second identical route overflows.
         router.route(0, &tenant, "a:1|c|#x:1\n");

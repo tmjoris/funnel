@@ -249,17 +249,19 @@ impl Aggregator {
     ) -> Result<SeriesId, Reject> {
         normalize_tags(&mut line.tags);
         let id = series_id(tenant, line.name, line.kind, &line.tags);
-        self.insert_prepared(now, id, tenant, line).map(|()| id)
+        self.insert_prepared(now, id, line, || SeriesKey::new(tenant, line))
+            .map(|()| id)
     }
 
-    /// Like [`insert`](Self::insert) for a line whose tags are normalized and
-    /// whose series id the caller already computed.
+    /// Like [`insert`](Self::insert) for a line whose series id the caller
+    /// already computed. `key` builds the series key and is called only for
+    /// a series with no open bucket, so `line` may be parsed without tags.
     pub fn insert_prepared(
         &mut self,
         now: u64,
         id: SeriesId,
-        tenant: &str,
         line: &Line<'_>,
+        key: impl FnOnce() -> SeriesKey,
     ) -> Result<(), Reject> {
         if line.values.is_empty() {
             return Ok(());
@@ -300,7 +302,7 @@ impl Aggregator {
                 self.series
                     .entry(id)
                     .or_insert_with(|| {
-                        let key = SeriesKey::new(tenant, line);
+                        let key = key();
                         *bytes += series_bytes(&key);
                         SeriesEntry {
                             key: Arc::new(key),

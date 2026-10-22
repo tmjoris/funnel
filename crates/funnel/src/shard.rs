@@ -9,17 +9,28 @@ use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
 
 use crate::aggregator::{self, Aggregator, Bucket, Reject};
 use crate::limiter::{self, Budgets, Limiter, TenantReport};
-use crate::protocol::{parse_line, take_tenant};
-use crate::series::{normalize_tags, series_id};
+use crate::protocol::{parse_line, parse_line_without_tags, take_tenant};
+use crate::series::{SeriesId, SeriesKey, normalize_tags};
 use crate::stats::Stats;
 use crate::unix_now;
 
-/// Lines for one shard, as text, so routing needs no per-line allocation.
+/// Lines for one shard. The text is kept as received so routing allocates
+/// nothing per line, and each item carries what the router already worked
+/// out (series id and tenant) so the shard does not parse tags again.
 pub struct Batch {
     pub now: u64,
-    pub default_tenant: Arc<str>,
+    pub tenants: Vec<Arc<str>>,
     pub text: String,
-    pub lines: u64,
+    pub items: Vec<Item>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct Item {
+    pub offset: u32,
+    pub len: u32,
+    pub id: u64,
+    /// Index into `Batch::tenants`.
+    pub tenant: u32,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -122,17 +133,14 @@ fn run(
 /// Applies one batch to a shard's aggregator and limiter. Public for benchmarks.
 pub fn process(batch: &Batch, agg: &mut Aggregator, limiter: &mut Limiter, stats: &Stats) {
     let (mut accepted, mut cardinality, mut too_old, mut future, mut overflow) = (0, 0, 0, 0, 0);
-    for raw in batch.text.lines() {
+    for item in &batch.items {
+        let raw = &batch.text[item.offset as usize..][..item.len as usize];
+        let tenant: &str = &batch.tenants[item.tenant as usize];
+        let id = SeriesId(item.id);
         // The router already validated these lines.
-        let Ok(mut line) = parse_line(raw) else {
+        let Ok(line) = parse_line_without_tags(raw) else {
             continue;
         };
-        let Ok(tenant) = take_tenant(&mut line) else {
-            continue;
-        };
-        let tenant = tenant.unwrap_or(&batch.default_tenant);
-        normalize_tags(&mut line.tags);
-        let id = series_id(tenant, line.name, line.kind, &line.tags);
         // Time checks come first so that a point about to be rejected does
         // not claim a series slot.
         if let Err(reject) = agg.check_time(batch.now, &line) {
@@ -146,7 +154,7 @@ pub fn process(batch: &Batch, agg: &mut Aggregator, limiter: &mut Limiter, stats
             cardinality += 1;
             continue;
         }
-        match agg.insert_prepared(batch.now, id, tenant, &line) {
+        match agg.insert_prepared(batch.now, id, &line, || full_key(raw, tenant)) {
             Ok(()) => accepted += 1,
             Err(Reject::TooOld) => too_old += 1,
             Err(Reject::Future) => future += 1,
@@ -158,4 +166,13 @@ pub fn process(batch: &Batch, agg: &mut Aggregator, limiter: &mut Limiter, stats
     Stats::add(&stats.rejected_too_old, too_old);
     Stats::add(&stats.rejected_future, future);
     Stats::add(&stats.rejected_overflow, overflow);
+}
+
+/// The series key for a line the router validated, built only when a shard
+/// meets a series for the first time.
+fn full_key(raw: &str, tenant: &str) -> SeriesKey {
+    let mut line = parse_line(raw).expect("router validated the line");
+    let _ = take_tenant(&mut line);
+    normalize_tags(&mut line.tags);
+    SeriesKey::new(tenant, &line)
 }

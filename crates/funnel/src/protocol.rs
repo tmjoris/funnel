@@ -68,6 +68,18 @@ pub const MAX_TAGS: usize = 32;
 
 /// Parses one line. Trailing `\r` and surrounding whitespace are ignored.
 pub fn parse_line(line: &str) -> Result<Line<'_>, ParseError> {
+    parse(line, true)
+}
+
+/// Parses a line that has already been validated by [`parse_line`], but
+/// skips its tags, which are most of a typical line. The shards use this:
+/// the router has already parsed the tags to compute the series id, and
+/// the shard needs them again only for a series it has not seen.
+pub fn parse_line_without_tags(line: &str) -> Result<Line<'_>, ParseError> {
+    parse(line, false)
+}
+
+fn parse(line: &str, with_tags: bool) -> Result<Line<'_>, ParseError> {
     let line = line.trim();
     if line.is_empty() {
         return Err(ParseError::Empty);
@@ -108,6 +120,9 @@ pub fn parse_line(line: &str) -> Result<Line<'_>, ParseError> {
                 _ => return Err(ParseError::SampleRate),
             };
         } else if let Some(tags) = section.strip_prefix('#') {
+            if !with_tags {
+                continue;
+            }
             for tag in tags.split(',').filter(|t| !t.is_empty()) {
                 let (k, v) = tag.split_once(':').unwrap_or((tag, ""));
                 if !valid_name(k) || !valid_tag_value(v) {
