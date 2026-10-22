@@ -6,6 +6,13 @@ numbers and, instead of storing every one, keeps a short summary for every
 10 seconds. The goal is to run it on a $5/month server and to measure how
 much storage and money that saves compared with keeping everything.
 
+The measured answer is in [WRITEUP.md](WRITEUP.md). In short: one cloud vCPU
+takes 1.3 million lines a second with no loss; the data needs 5.6x less disk
+than raw points in ClickHouse with its best codecs, and the gap widens with
+traffic; percentiles stay within 1% of the exact answer; and a workload of
+7,000 series that would cost about $1,925 a month on Datadog or $295 to $360
+on Grafana Cloud at list prices fits on a $6 to $12 server.
+
 ## The problem
 
 Storing these numbers in a hosted service gets expensive for two reasons.
@@ -85,10 +92,16 @@ series to new ones at the boundary.
 dropped for overload, or rejected for being too old, too far in the future,
 over the memory bound or over the series limit.
 
-A writer thread collects flushed buckets per tenant and, once a minute,
-writes one zstd-compressed block file per tenant, named by its time range
-so queries can skip files without opening them. Files are written under a
-temporary name, synced and renamed, so a crash leaves whole files only.
+Every 5 seconds the shards also flush their open windows early, as partial
+buckets that queries and compaction merge back together, and a writer thread
+writes what it has collected as one small zstd-compressed block file per
+tenant. A per-tenant manifest, replaced atomically, lists the live files, so
+after a crash the set of files is either the old one or the new one.
+Compaction merges each closed 10-minute span into one file, merging partial
+buckets as it goes, and swaps inputs for output in a single manifest update.
+This follows VictoriaMetrics (frequent small parts merged later, no
+write-ahead log) and Prometheus (time-aligned compaction, deferred deletion
+of compacted files).
 
 `GET /query` reads one metric over a time range, with optional tag filters,
 grouping and a step, and returns one number per point:
@@ -158,20 +171,20 @@ which jump around from bucket to bucket.
   queue and cause drops for others.
 - The series limit costs about 10 bytes per admitted series per tenant:
   fine for tens of tenants, too much for tens of thousands.
-- Queries read only what is on disk, so the newest minute or so (one writer
-  segment plus the flush delay) is not visible yet.
-- A crash loses the rollups waiting for the next block write, up to one
-  segment (60 seconds by default).
-- Block files are never merged, so a long time range opens many one-minute
-  files and repeats the series index in each. Compacting them into hourly
-  blocks is the obvious next step.
+- A crash loses up to about 10 seconds of data: open windows since the last
+  checkpoint and rollups since the last file write. New data takes 2 to 5
+  seconds to show up in queries.
+- One file per tenant every 5 seconds suits tens of tenants; thousands
+  would want a single write-ahead log shared by all of them.
+- There is no downsampling, so keeping data for months costs the same per
+  day as the first week.
 
 ## Status
 
 | crate | state |
 |---|---|
 | [`crates/sketch`](crates/sketch) | Done. DDSketch with property-tested error bounds; faster inserts and merges than `sketches-ddsketch` and under 1% error where t-digest reaches 32% |
-| `crates/funnel` | Ingest, rollups, late data, memory bound, series limits, block storage and queries work. Load testing, the ClickHouse comparison and the cost write-up are next |
+| `crates/funnel` | Ingest, rollups, late data, memory bound, series limits, block storage with compaction, and queries. Load tested, profiled, compared with ClickHouse; results in [WRITEUP.md](WRITEUP.md) |
 | [`crates/loadgen`](crates/loadgen) | Deterministic StatsD workload shaped like a small SaaS backend |
 
 ## Building and testing
