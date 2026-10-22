@@ -203,11 +203,12 @@ mod linux {
 fn receive(socket: UdpSocket, router: &Router, tenant: &Arc<str>, stop: &AtomicBool) {
     let mut datagrams = Datagrams::new();
     let mut pending = String::with_capacity(BATCH_BYTES + MAX_DATAGRAM);
-    let mut packets = 0;
     loop {
         match datagrams.recv(&socket) {
             Ok(n) => {
-                packets += n as u64;
+                // Counted on arrival: a batch of datagrams that are all
+                // invalid routes nothing, and must still be counted.
+                Stats::add(&router.stats().packets_received, n as u64);
                 for i in 0..n {
                     match datagrams.get(i).map(std::str::from_utf8) {
                         Some(Ok(text)) => {
@@ -238,9 +239,7 @@ fn receive(socket: UdpSocket, router: &Router, tenant: &Arc<str>, stop: &AtomicB
         }
         if !pending.is_empty() {
             router.route(unix_now(), tenant, &pending);
-            Stats::add(&router.stats().packets_received, packets);
             pending.clear();
-            packets = 0;
         }
     }
 }
