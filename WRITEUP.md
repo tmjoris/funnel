@@ -18,6 +18,7 @@ providers' own pages in October 2026.
 | Disk per raw point | 0.48 bytes, against 2.72 for raw points in ClickHouse with its best codecs (5.6x smaller) |
 | Growth with traffic | 40x the traffic over the same series needs 3.3x the disk |
 | Percentile accuracy, end to end | within 0.85% of the exact answer computed by ClickHouse |
+| A year of data, downsampled after 7 and 30 days | about 35 GB, against 345 GB at full resolution and 1.9 TB as raw points in ClickHouse |
 | Data lost to `kill -9` | 2 to 7 seconds of traffic in two runs; at most about 10 by design |
 | Delay before data is queryable | 2 to 5 seconds |
 | Monthly cost for the test workload | $6 to $12 on a DigitalOcean droplet, against about $1,925 on Datadog and $295 to $360 on Grafana Cloud at list prices |
@@ -216,6 +217,47 @@ compaction:
 How much a crash loses depends on where in the 5-second checkpoint and
 write cycles it lands; the worst case is about 10 seconds.
 
+## Downsampling
+
+Old data is rarely looked at in 10-second detail, so Funnel can rewrite it
+into wider buckets as it ages: `--downsample 7d:1m,30d:10m` keeps 1-minute
+buckets after 7 days and 10-minute buckets after 30, using the syntax of
+VictoriaMetrics' `-downsampling.period`. Compaction does the rewriting, each
+level with files 60 buckets long, and only once a whole span is older than
+its level's age.
+
+Because every bucket is a mergeable summary, downsampling is the same merge
+as everything else. Counters stay exact, gauges keep their true min and
+max, and distributions keep their sketches. The systems Funnel borrows from
+keep less: VictoriaMetrics' downsampling keeps the last sample of each
+interval, which drops spikes, and Thanos keeps count, sum, min and max,
+which rules out percentiles.
+
+[`examples/downsample.rs`](crates/funnel/examples/downsample.rs) stores 30
+minutes of the workload at each resolution through a real store:
+
+| resolution | bytes | smaller than 10 s | disk for 30 days |
+|---|---|---|---|
+| 10 seconds | 19.7 MB | 1.0x | 28.3 GB |
+| 1 minute | 6.5 MB | 3.0x | 9.3 GB |
+| 10 minutes | 1.3 MB | 14.9x | 1.9 GB |
+
+One minute saves 3x rather than 6x because a merged sketch holds more
+distinct bins than each of the six it replaced. With `7d:1m,30d:10m`, a year
+of this workload is about 35 GB: 6.6 GB for the first week, 7.1 GB for the
+rest of the month and 21 GB for the other eleven months.
+
+Percentiles over a whole range do not change at all.
+[`examples/query_check.rs`](crates/funnel/examples/query_check.rs) gives the
+same p50, p99 and p99.9 for route `/r3` (67.27, 354.76 and 2,571.60 ms) at
+10-second, 1-minute and 10-minute resolution, reading 13,554, 2,959 and 300
+buckets. What is lost is the ability to look inside a bucket: last month's
+data cannot show what happened in one particular 10 seconds.
+
+A query that mixes resolutions computes a rate over each bucket's real
+width: a 10-second step over 1-minute buckets divides by 60, not by 10. A
+test checks this, and fails with a rate 6 times too high without it.
+
 ## Monthly cost
 
 For the test workload, 7,000 series and 22,600 points a second:
@@ -225,11 +267,11 @@ blocks take about 0.94 GB a day for this workload, so 30 days need about
 28 GB. A [DigitalOcean](https://www.digitalocean.com/pricing/droplets)
 droplet with 1 vCPU and 1 GiB of RAM costs $6 a month with 25 GiB of disk
 (about 3 weeks of data after the operating system) and $12 with 50 GiB
-(30 days). Funnel used under
-50 MB of memory in every test above.
+(30 days at full resolution, or about a year with downsampling after 7 and
+30 days). Funnel used under 50 MB of memory in every test above.
 
 **Raw points in ClickHouse.** At 2.72 bytes per point, the same traffic is
-5.3 GB a day, 159 GB for 30 days, before replicas.
+5.3 GB a day, 159 GB for 30 days and 1.9 TB for a year, before replicas.
 
 **Datadog.** Datadog bills custom metrics at
 [$5 per 100 per month](https://www.datadoghq.com/pricing/list/). A
@@ -251,8 +293,8 @@ available, would cut this sharply.
 
 At 40 times the traffic over the same series, the hosted bills stay about
 the same, since both price by series. Raw storage grows 40 times, to 212 GB
-a day. Funnel's grows 3.3 times, to about 3.1 GB a day, which needs a larger
-disk or downsampling older data.
+a day. Funnel's grows 3.3 times, to about 3.1 GB a day at full resolution,
+and downsampling shrinks everything older than a week.
 
 Since this project started from Azure Data Explorer: for this kind of
 question (one metric, a time range, a filter, a percentile), rolling up
@@ -270,8 +312,8 @@ ad hoc analysis over raw events, which Funnel does not keep.
   want one shared write-ahead log.
 - A crash loses up to about 10 seconds: open windows since the last
   checkpoint and rollups since the last file write.
-- There is no downsampling yet, so long retention costs the same per day as
-  the first week.
+- Downsampled data cannot be queried at a finer resolution than its
+  buckets.
 
 ## Reproducing
 
@@ -282,7 +324,8 @@ python3 scripts/durability_test.py
 cargo run --release -p funnel --example storage -- 10
 cargo run --release -p funnel --example scaling -- 3 50 500 2000
 scripts/clickhouse_compare.sh 10                                  # needs Docker
-cargo run --release -p funnel --example query_check -- 10 /r3
+cargo run --release -p funnel --example query_check -- 10 /r3       # add 600 to downsample first
+cargo run --release -p funnel --example downsample -- 30
 cargo run --release -p funnel --example ingest -- 30
 cargo run --release -p funnel --features profile -- --profile flame.svg
 ```
