@@ -7,7 +7,7 @@ numbers and, instead of storing every one, keeps a short summary for every
 much storage and money that saves compared with keeping everything.
 
 The measured answer is in [WRITEUP.md](WRITEUP.md). In short: one cloud vCPU
-takes 1.3 million lines a second with no loss; the data needs 5.6x less disk
+takes 1.5 to 2 million lines a second with no loss; the data needs 5.6x less disk
 than raw points in ClickHouse with its best codecs, and the gap widens with
 traffic; percentiles stay within 1% of the exact answer; and a workload of
 7,000 series that would cost about $1,925 a month on Datadog or $295 to $360

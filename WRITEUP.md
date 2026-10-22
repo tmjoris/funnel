@@ -14,7 +14,7 @@ providers' own pages in October 2026.
 
 | | Result |
 |---|---|
-| Ingest on one cloud vCPU | 1.3 million lines/s with no loss, 31 to 49 MB of memory |
+| Ingest on one cloud vCPU | 1.5 to 2.0 million lines/s with no loss, depending on the CPU; under 50 MB of memory |
 | Disk per raw point | 0.48 bytes, against 2.72 for raw points in ClickHouse with its best codecs (5.6x smaller) |
 | Growth with traffic | 40x the traffic over the same series needs 3.3x the disk |
 | Percentile accuracy, end to end | within 0.85% of the exact answer computed by ClickHouse |
@@ -59,23 +59,30 @@ them. The [load test workflow](.github/workflows/loadtest.yml) runs it on
 GitHub's cloud VMs with Funnel pinned to one vCPU, which is what a $5 to $6
 server offers.
 
-| one vCPU, lines/s sent | Neoverse-N2 (ARM) | AMD EPYC 7763 | Intel Xeon Platinum 8573C |
+Highest rate tested with nothing lost, Funnel pinned to one vCPU, with the
+workload packed into 1,432-byte packets as StatsD clients usually send it:
+
+| CPU | no loss up to | Funnel's CPU at that rate | at 2.5 M lines/s |
 |---|---|---|---|
-| 400,000 | all accepted, 0.21 cores | all accepted, 0.34 cores | all accepted, 0.21 cores |
-| 1,000,000 | all accepted, 0.47 cores | all accepted, 0.66 cores | all accepted, 0.46 cores |
-| 1,300,000 | all accepted, 0.61 cores | all accepted, 0.80 cores | all accepted, 0.60 cores |
-| as fast as possible | 1.7 to 1.9 M accepted | 1.6 M accepted | 2.2 M accepted |
+| Neoverse-N2 (ARM), 2 runs | 2.0 M lines/s | 0.76 to 0.77 cores | 2.15 to 2.18 M accepted |
+| Intel Xeon Platinum 8573C | 1.5 M lines/s (2.0 M with 0.3% lost) | 0.66 cores | 1.99 M accepted |
+| Intel Xeon Platinum 8370C | 1.5 M lines/s | 0.71 cores | 1.84 M accepted |
+
+With every metric in its own small packet, the worst case for per-packet
+costs, one vCPU took 600,000 packets a second with nothing lost on the
+Neoverse-N2 and Xeon 8573C, and 400,000 on the older Xeon 8370C.
 
 The core count is Funnel's own CPU time; the kernel's network processing on
 the same vCPU takes the rest, which is why throughput stops growing before
-the process reaches one full core. At the "as fast as possible" rate the
-sender pushes 8 to 25 million lines a second, most of which the kernel
-drops; memory stays between 37 and 41 MB because Funnel sheds load instead
-of queueing it. The test workload's 22,600 lines/s is under 2% of what one
-vCPU sustained.
+the process reaches one full core. When the sender floods the socket with 8
+to 25 million lines a second, the kernel drops most of them, Funnel keeps
+accepting what it can, and memory stays around 40 MB because Funnel sheds
+load instead of queueing it. The test workload's 22,600 lines/s is about 1%
+of what one vCPU sustained.
 
 On the 2015 laptop this was developed on (an Intel i5-6200U), one core
-sustained 400,000 lines/s. The cloud numbers are what a server would see.
+sustained 550,000 lines/s, with the sender competing for the same CPU. The
+cloud numbers are what a server would see.
 
 ### What profiling changed
 
@@ -93,9 +100,26 @@ was under 2% of the time:
   line. Shard work fell from 805 to 395 ns per line.
 
 Together they cut CPU per line by 40% (1.25 to 0.75 laptop cores at
-400,000 lines/s). What remains is mostly the router's one parse; a single-pass
-byte scanner and `recvmmsg`, which reads many packets per system call, are
-the next steps the profile points to.
+400,000 lines/s). Two more changes followed the next profile:
+
+- The parser cut each line apart with a dozen `str::split` calls, each with
+  a setup cost out of proportion to the few bytes it searched. A single pass
+  over the bytes, writing into buffers reused across lines, took routing
+  from 700 to about 500 ns per line and shard work from 395 to about 290.
+  A property test checks that it accepts and rejects exactly what the old
+  parser did, down to the error it reports, on thousands of generated and
+  mutated lines.
+- `recvmmsg` receives up to 32 datagrams per system call instead of one. On
+  the laptop with each metric in its own packet, it raised the most Funnel
+  accepted on one CPU by about 19%, from an average of 240,000 to 285,000
+  packets a second over two rounds of alternating builds, and cut CPU by
+  about 5% with full packets. The gain is modest because most of the
+  cost of a packet is the kernel's network stack, which batching the system
+  call does not change.
+
+The in-process benchmark ([`examples/ingest.rs`](crates/funnel/examples/ingest.rs))
+went from 1.8 to 0.79 microseconds per line over these four changes, or
+from 0.56 to 1.27 million lines a second per laptop core.
 
 ## Storage
 
