@@ -1,0 +1,39 @@
+name: Load test
+
+on:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: never
+
+jobs:
+  one-vcpu:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release -p funnel -p loadgen
+      - name: Machine
+        run: |
+          { lscpu | grep -E 'Architecture|Model name|^CPU\(s\)'; free -h | head -2; } | tee machine.txt
+          sudo sysctl -w net.core.rmem_max=16777216
+      - name: One vCPU
+        run: |
+          python3 scripts/loadtest.py --cpus 0 --shards 1 --udp-threads 1 \
+            --rates 100000,200000,300000,400000,0 --duration 10 | tee one-vcpu.txt
+      - name: All vCPUs
+        run: |
+          python3 scripts/loadtest.py --shards 2 --udp-threads 2 \
+            --rates 400000,600000,800000,0 --duration 10 | tee all-vcpus.txt
+      - name: Summary
+        run: |
+          { echo "## ${{ matrix.runner }}"; echo '```'; cat machine.txt one-vcpu.txt all-vcpus.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: loadtest-${{ matrix.runner }}
+          path: "*.txt"

@@ -50,8 +50,9 @@ def counters():
 
 def run(rate, args):
     data = tempfile.mkdtemp(prefix="funnel-load-")
+    pin = ["taskset", "-c", args.cpus] if args.cpus else []
     server = subprocess.Popen(
-        [FUNNEL, "--udp", "127.0.0.1:18125", "--http", "127.0.0.1:18080",
+        pin + [FUNNEL, "--udp", "127.0.0.1:18125", "--http", "127.0.0.1:18080",
          "--shards", str(args.shards), "--udp-threads", str(args.udp_threads),
          "--data-dir", data],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -111,9 +112,11 @@ def main():
     p.add_argument("--shards", type=int, default=2)
     p.add_argument("--udp-threads", type=int, default=2)
     p.add_argument("--senders", type=int, default=2)
+    p.add_argument("--cpus", default="",
+                   help="pin the server to these CPUs with taskset, e.g. 0 to model a 1-vCPU server")
     args = p.parse_args()
-    print(f"{os.cpu_count()} CPUs; shards={args.shards} udp_threads={args.udp_threads} "
-          f"senders={args.senders}; {args.duration}s per rate")
+    print(f"{os.cpu_count()} CPUs, server pinned to {args.cpus or 'all'}; shards={args.shards} "
+          f"udp_threads={args.udp_threads} senders={args.senders}; {args.duration}s per rate")
     print(f"{'target/s':>9} {'sent/s':>10} {'accepted/s':>11} {'shed/s':>9} "
           f"{'lost in kernel':>15} {'CPU cores':>9} {'RSS MB':>7}")
     for rate in [int(r) for r in args.rates.split(",")]:
