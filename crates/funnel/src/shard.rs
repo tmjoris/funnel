@@ -119,7 +119,8 @@ fn run(
     reports.lock().unwrap()[index] = report(&agg, &limiter);
 }
 
-fn process(batch: &Batch, agg: &mut Aggregator, limiter: &mut Limiter, stats: &Stats) {
+/// Applies one batch to a shard's aggregator and limiter. Public for benchmarks.
+pub fn process(batch: &Batch, agg: &mut Aggregator, limiter: &mut Limiter, stats: &Stats) {
     let (mut accepted, mut cardinality, mut too_old, mut future, mut overflow) = (0, 0, 0, 0, 0);
     for raw in batch.text.lines() {
         // The router already validated these lines.

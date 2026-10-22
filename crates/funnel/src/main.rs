@@ -55,6 +55,12 @@ struct Args {
     /// Delete data older than this many days; keep everything if unset.
     #[arg(long, env = "FUNNEL_RETENTION_DAYS")]
     retention_days: Option<u64>,
+    /// Sample CPU usage until shutdown and write a flamegraph here, plus a
+    /// `.txt` list of the functions with the most self time. Needs the
+    /// `profile` feature.
+    #[cfg(feature = "profile")]
+    #[arg(long)]
+    profile: Option<std::path::PathBuf>,
 }
 
 #[tokio::main]
@@ -65,6 +71,14 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
     let args = Args::parse();
+    #[cfg(feature = "profile")]
+    let profiler = args.profile.as_ref().map(|_| {
+        pprof::ProfilerGuardBuilder::default()
+            .frequency(999)
+            .blocklist(&["libc", "libgcc", "pthread", "vdso"])
+            .build()
+            .expect("start profiler")
+    });
     anyhow::ensure!(
         funnel::protocol::valid_tenant(&args.default_tenant),
         "invalid default tenant"
@@ -187,5 +201,39 @@ async fn main() -> anyhow::Result<()> {
     let _ = writer.join();
     let _ = compactor.join();
     tracing::info!(stats = ?stats.snapshot(), "stopped");
+    #[cfg(feature = "profile")]
+    if let (Some(path), Some(guard)) = (&args.profile, profiler) {
+        write_profile(path, &guard)?;
+    }
+    Ok(())
+}
+
+/// Writes the flamegraph and a self-time summary next to it.
+#[cfg(feature = "profile")]
+fn write_profile(path: &std::path::Path, guard: &pprof::ProfilerGuard<'_>) -> anyhow::Result<()> {
+    use std::collections::HashMap;
+    use std::io::Write;
+
+    let report = guard.report().build()?;
+    report.flamegraph(std::fs::File::create(path)?)?;
+    let total: isize = report.data.values().sum();
+    let mut self_time: HashMap<String, isize> = HashMap::new();
+    for (frames, count) in &report.data {
+        // The innermost frame is where the sample landed.
+        let leaf = frames
+            .frames
+            .first()
+            .and_then(|f| f.first())
+            .map_or_else(|| "?".to_string(), |s| s.name());
+        *self_time.entry(leaf).or_default() += count;
+    }
+    let mut top: Vec<_> = self_time.into_iter().collect();
+    top.sort_by(|a, b| b.1.cmp(&a.1));
+    let mut out = std::fs::File::create(path.with_extension("txt"))?;
+    writeln!(out, "{total} samples; functions by self time")?;
+    for (name, n) in top.iter().take(40) {
+        writeln!(out, "{:>6.2}%  {name}", *n as f64 * 100.0 / total as f64)?;
+    }
+    tracing::info!(path = %path.display(), samples = total, "wrote profile");
     Ok(())
 }
