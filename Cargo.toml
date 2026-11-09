@@ -8,3 +8,7 @@ license = "MIT"
 
 [profile.release]
 debug = 1
+
+# DataFusion is large; skipping debug info for dependencies keeps target/ small.
+[profile.dev.package."*"]
+debug = false
