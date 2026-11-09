@@ -23,7 +23,7 @@ SQL, from Funnel or from other tools such as Apache Spark.
 ## Try it
 
 You need Rust, Python 3 and `curl`. The first build compiles DataFusion and took
-about 40 minutes on a 4-core laptop.
+roughly an hour on a 4-core laptop.
 
 ```sh
 cargo build --release -p funnel --features lake
