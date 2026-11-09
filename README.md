@@ -1,17 +1,77 @@
 # Funnel
 
-Apps report numbers about themselves all the time: how many requests they
-handled, how long each one took, how full a queue is. Funnel collects those
-numbers and, instead of storing every one, keeps a short summary for every
-10 seconds. The goal is to run it on a $5/month server and to measure how
-much storage and money that saves compared with keeping everything.
+Funnel is a metrics service written in Rust. Your apps send it numbers about
+themselves, such as how many requests they handled and how long each one took.
+Funnel keeps a short summary for every 10 seconds instead of every number,
+answers queries over those summaries, and saves closed hours to
+[Apache Iceberg](https://iceberg.apache.org/) tables that you can query with
+SQL, from Funnel or from other tools such as Apache Spark.
 
-The measured answer is in [WRITEUP.md](WRITEUP.md). In short: one cloud vCPU
-takes 1.5 to 2 million lines a second with no loss; the data needs 5.6x less disk
-than raw points in ClickHouse with its best codecs, and the gap widens with
-traffic; percentiles stay within 1% of the exact answer; and a workload of
-7,000 series that would cost about $1,925 a month on Datadog or $295 to $360
-on Grafana Cloud at list prices fits on a $6 to $12 server.
+## What it does
+
+- Takes [StatsD](https://github.com/statsd/statsd) metrics over UDP and HTTP.
+  Each CPU core owns its own share of the series, so the ingest path takes no
+  locks.
+- Keeps counters, gauges and percentiles for every 10 seconds, per tenant.
+- Answers dashboard-style questions at `GET /query`.
+- Answers SQL at `POST /sql`, using
+  [Apache DataFusion](https://datafusion.apache.org/). A planning rule reads an
+  hourly or per-minute summary whenever that gives the same answer, which made
+  a 7-day latency chart 31 times faster.
+- Keeps tenants apart. A SQL query can only see the caller's own data.
+
+## Try it
+
+You need Rust, Python 3 and `curl`. The first build compiles DataFusion and took
+about 40 minutes on a 4-core laptop.
+
+```sh
+cargo build --release -p funnel --features lake
+scripts/demo.sh
+```
+
+The script starts Funnel on a temporary directory, sends it three hours of
+made-up metrics, waits for them to reach Iceberg, and runs some queries. This is
+a real run of it:
+
+![Output of scripts/demo.sh](docs/images/demo.png)
+
+`x-funnel-rollup-seconds: 3600` shows the planner answered from the hourly table.
+The `/sql` and `/query` totals match because they read the same data by different
+routes.
+
+## Use it yourself
+
+Start the server, then send a metric and read it back. Metrics appear in `/query`
+within about 15 seconds. They reach `/sql` once their hour has closed, up to about
+75 minutes later, so `scripts/backfill.py` sends data from hours that have already
+closed.
+
+```sh
+./target/release/funnel --data-dir data --lake-dir lake
+
+# In another terminal:
+curl -s localhost:8080/ingest -H 'x-funnel-tenant: acme' -d 'http.requests:42|c|#host:web-1'
+curl -s 'localhost:8080/query?metric=http.requests&group_by=host&step=60&agg=sum' -H 'x-funnel-tenant: acme'
+
+python3 scripts/backfill.py --url http://localhost:8080
+curl -s localhost:8080/sql -H 'x-funnel-tenant: acme' \
+  -d "SELECT tags, max(max) AS peak FROM metrics WHERE metric = 'queue.depth' GROUP BY 1 ORDER BY 1"
+```
+
+![Sending and querying metrics by hand](docs/images/manual.png)
+
+In SQL, `metrics` has one row per series per 10 seconds, with the columns
+`tenant`, `metric`, `tags`, `kind`, `ts`, `count`, `sum`, `min`, `max`, `last`,
+`last_at` and `sketch`. Use `quantile(sketch, 0.99)` for percentiles.
+
+## How much it saves
+
+One cloud vCPU takes 1.5 to 2 million lines a second with no loss. The data needs
+5.6 times less disk than raw points in ClickHouse with its best codecs, and
+percentiles stay within 1% of the exact answer. A workload of 7,000 series that
+would cost about $1,925 a month on Datadog or $295 to $360 on Grafana Cloud at list
+prices fits on a $6 to $12 server. [WRITEUP.md](WRITEUP.md) has the measurements.
 
 ## The problem
 
