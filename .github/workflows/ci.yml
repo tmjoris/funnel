@@ -20,4 +20,6 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo clippy -p funnel --features profile -- -D warnings
+      - run: cargo clippy -p funnel --features lake --all-targets -- -D warnings
       - run: cargo test --workspace
+      - run: cargo test -p funnel --features lake

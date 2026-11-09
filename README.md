@@ -123,6 +123,76 @@ window, several hosts grouped into one line and six 10-second buckets folded
 into a minute. Merging sketches is what makes a grouped p99 correct; an
 average of per-host p99s is not the p99 of all requests.
 
+## Long-term SQL with Iceberg
+
+Built with `--features lake` and started with `--lake-dir DIR`, Funnel also publishes each closed
+hour to [Apache Iceberg](https://iceberg.apache.org/) tables, stored as Apache Parquet files, and
+serves SQL through [Apache DataFusion](https://datafusion.apache.org/) at `POST /sql`. The block
+store above still handles recent data and `GET /query`.
+
+Iceberg is an open table format: a set of metadata files that says which Parquet files make up a
+table. It means a team can read a year of metrics from Spark or any other Iceberg engine without
+exporting anything, which a private block format cannot offer.
+
+```sh
+curl localhost:8080/sql -H 'x-funnel-tenant: acme' -d "
+  SELECT date_bin(INTERVAL '1 hour', ts) AS hour, quantile(sketch, 0.99) AS p99
+  FROM metrics
+  WHERE metric = 'http.duration'
+    AND ts >= TIMESTAMP '2026-01-01T00:00:00' AND ts < TIMESTAMP '2026-01-08T00:00:00'
+  GROUP BY 1 ORDER BY 1"
+```
+
+Each hour lands in four tables: `metrics` (10-second buckets), `metrics_1m`, `metrics_10m` and
+`metrics_1h`. Queries name `metrics`, and a [planning rule](crates/lake/src/rule.rs) moves each one
+to the coarsest table that gives the same answer. It runs inside DataFusion's optimizer and only
+acts when the result is guaranteed to stay equal:
+
+- Every aggregate has to merge: `sum(sum)`, `sum(count)`, `min(min)`, `max(max)` or
+  `quantile(sketch, q)`. `count(*)` counts stored rows, which differ per table, so it stays put.
+- A `date_bin` step has to be a multiple of the table's bucket width.
+- Time bounds have to be `ts >= a` and `ts < b` on bucket boundaries.
+- Filters can only use series columns, since value columns hold different numbers in each table.
+- The table has to be published at least as far as the query reaches.
+
+The test suite runs 200 generated queries with the rule on and off and requires equal answers.
+Breaking any of three safety checks on purpose (time alignment, step divisibility, value filters)
+makes that test fail.
+
+Measured on an Intel i5-6200U laptop with 7 days of 600 series at 10-second resolution (36.3 million
+rows, 200 hosts with three metrics each). Each figure is the median of 5 alternating runs, with
+all planning, reading and aggregation included.
+
+| Dashboard | Table chosen | Without the rule | With the rule | Speedup |
+|---|---|---|---|---|
+| p99 latency, 7 days, per hour | 1 hour | 13,524 ms | 428 ms | 31.6x |
+| peak queue per host, 7 days | 1 hour | 1,381 ms | 290 ms | 4.8x |
+| request total, 1 day, per 10 minutes | 10 minutes | 394 ms | 224 ms | 1.8x |
+| p99 latency, 1 hour, per minute | 1 minute | 289 ms | 234 ms | 1.2x |
+| request total, 7 days, end not on a boundary | 10 seconds (unchanged) | 1,132 ms | 1,112 ms | 1.0x |
+
+The gain grows with the time range. The with-rule times have a floor of about 220 to 290 ms that
+a smaller table does not remove, so short queries gain little.
+
+| Table | Parquet size | Share of the finest |
+|---|---|---|
+| `metrics` | 913.5 MB | 100% |
+| `metrics_1m` | 215.8 MB | 24% |
+| `metrics_10m` | 34.1 MB | 3.7% |
+| `metrics_1h` | 9.3 MB | 1.0% |
+
+The coarser tables add 28% to the size of the finest one.
+
+The tables use the standard Iceberg SQL catalog, so other engines open them directly. Spark 4.0.2
+read them through its JDBC catalog, on its own JVM scan and on the native scans of Comet 1.2.0 and
+Velox (Gluten 1.7.0). All three matched DataFusion exactly on two aggregate queries over 7 days
+of data, one of them answered by DataFusion from the hourly rollup. [`interop/`](interop) has
+that check.
+
+Each SQL session is limited to the caller's tenant by a rule that filters every table scan, so a
+query cannot read another tenant's rows by leaving out a filter. Only read-only statements run, each
+with a 1 GB memory limit and a 30-second timeout.
+
 ## Storage: what each format costs
 
 A [benchmark](crates/funnel/examples/storage.rs) generates 10 minutes of a
@@ -185,6 +255,12 @@ which jump around from bucket to bucket.
   would want a single write-ahead log shared by all of them.
 - Downsampled data cannot be queried at a finer resolution than its
   buckets.
+- The lake only receives an hour once it is compacted, so `/sql` lags `/query` by up to about 75
+  minutes by default. Points that arrive after their hour was published reach `/query` only.
+- The lake writes one Parquet file per table per hour and has no compaction of its own, so a
+  year means about 8,760 files per table, and planning time grows with it.
+- `/sql` has the same trust model as `/query`: the tenant comes from a header, with no
+  authentication.
 
 ## Status
 
@@ -193,6 +269,7 @@ which jump around from bucket to bucket.
 | [`crates/sketch`](crates/sketch) | Done. DDSketch with property-tested error bounds; faster inserts and merges than `sketches-ddsketch` and under 1% error where t-digest reaches 32% |
 | `crates/funnel` | Ingest, rollups, late data, memory bound, series limits, block storage with compaction, and queries. Load tested, profiled, compared with ClickHouse; results in [WRITEUP.md](WRITEUP.md) |
 | [`crates/loadgen`](crates/loadgen) | Deterministic StatsD workload shaped like a small SaaS backend |
+| [`crates/lake`](crates/lake) | Iceberg publishing, the `quantile` aggregate, and the DataFusion rollup and tenant rules |
 
 ## Building and testing
 
@@ -203,6 +280,10 @@ cargo run --release -p funnel-sketch --example accuracy
 cargo run --release -p funnel --example storage -- 10   # minutes of workload
 
 cargo run --release -p funnel -- --data-dir data   # UDP :8125, HTTP :8080
+
+# With Iceberg publishing and SQL
+cargo run --release -p funnel --features lake -- --data-dir data --lake-dir lake
+cargo run --release -p funnel-lake --example bench -- /tmp/lake 7 200   # days, hosts
 ```
 
 ## License
