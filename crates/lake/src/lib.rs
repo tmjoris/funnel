@@ -12,6 +12,7 @@ pub mod lake;
 pub mod quantile;
 pub mod row;
 pub mod rule;
+pub mod scope;
 
 pub use lake::{Lake, RESOLUTIONS, Resolution};
 pub use row::Row;

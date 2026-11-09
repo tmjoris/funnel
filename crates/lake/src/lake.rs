@@ -3,18 +3,22 @@
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use datafusion::arrow::array::{
     ArrayRef, Float64Builder, LargeBinaryBuilder, StringBuilder, TimestampMicrosecondBuilder,
 };
 use datafusion::arrow::datatypes::SchemaRef;
+use datafusion::arrow::json::ArrayWriter;
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::catalog::CatalogProvider;
 use datafusion::datasource::provider_as_source;
 use datafusion::execution::SessionStateBuilder;
+use datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use datafusion::logical_expr::TableSource;
-use datafusion::prelude::{SessionConfig, SessionContext};
+use datafusion::prelude::{SQLOptions, SessionConfig, SessionContext};
 use iceberg::arrow::schema_to_arrow_schema;
 use iceberg::io::LocalFsStorageFactory;
 use iceberg::spec::{DataFileFormat, NestedField, PrimitiveType, Schema, Type};
@@ -39,6 +43,7 @@ use uuid::Uuid;
 
 use crate::row::{Row, coarsen};
 use crate::rule::{ChooseRollup, Rollup, RuleStats};
+use crate::scope::TenantScope;
 
 /// One table: its name and the width of its buckets in seconds.
 #[derive(Clone, Copy, Debug)]
@@ -74,8 +79,20 @@ const WATERMARKS: &str = "funnel.watermarks";
 /// Rows per Parquet row group. Small enough that a time filter can skip most of a file.
 const ROW_GROUP_ROWS: usize = 32 * 1024;
 
+/// Upper limits for one SQL query, so one request cannot take down the ingest path.
+const QUERY_MEMORY_BYTES: usize = 1 << 30;
+const QUERY_TIMEOUT: Duration = Duration::from_secs(30);
+
 pub struct Lake {
     catalog: Arc<dyn Catalog>,
+}
+
+/// The answer to a SQL query.
+pub struct QueryOutput {
+    /// A JSON array with one object per row.
+    pub json: Vec<u8>,
+    /// Bucket width of the rollup used, if the planner moved off the finest table.
+    pub rollup_seconds: Option<u64>,
 }
 
 fn schema() -> Result<Schema> {
@@ -227,7 +244,13 @@ impl Lake {
 
     /// Opens a SQL session. With `rollups` off, every query reads the finest table, which is how
     /// tests prove the rule changes nothing but cost.
-    pub async fn session(&self, rollups: bool) -> Result<(SessionContext, Arc<RuleStats>)> {
+    ///
+    /// With `tenant` set, every scan is limited to that tenant.
+    pub async fn session(
+        &self,
+        rollups: bool,
+        tenant: Option<&str>,
+    ) -> Result<(SessionContext, Arc<RuleStats>)> {
         let provider = IcebergCatalogProvider::try_new(self.catalog.clone()).await?;
         let schema = provider
             .schema(NAMESPACE)
@@ -252,9 +275,16 @@ impl Lake {
 
         let stats = Arc::new(RuleStats::default());
         let config = SessionConfig::new().with_default_catalog_and_schema(CATALOG_NAME, NAMESPACE);
+        let runtime = RuntimeEnvBuilder::new()
+            .with_memory_limit(QUERY_MEMORY_BYTES, 1.0)
+            .build_arc()?;
         let mut builder = SessionStateBuilder::new()
             .with_config(config)
+            .with_runtime_env(runtime)
             .with_default_features();
+        if let Some(tenant) = tenant {
+            builder = builder.with_analyzer_rule(Arc::new(TenantScope::new(tenant)));
+        }
         if rollups {
             builder =
                 builder.with_optimizer_rule(Arc::new(ChooseRollup::new(tables, stats.clone())));
@@ -263,6 +293,31 @@ impl Lake {
         ctx.register_catalog(CATALOG_NAME, Arc::new(provider));
         ctx.register_udaf(crate::quantile::udaf());
         Ok((ctx, stats))
+    }
+}
+
+impl Lake {
+    /// Runs read-only SQL for one tenant and returns its rows as a JSON array.
+    pub async fn query(&self, sql: &str, tenant: &str) -> Result<QueryOutput> {
+        let (ctx, stats) = self.session(true, Some(tenant)).await?;
+        let options = SQLOptions::new()
+            .with_allow_ddl(false)
+            .with_allow_dml(false)
+            .with_allow_statements(false);
+        let frame = ctx.sql_with_options(sql, options).await?;
+        let batches = tokio::time::timeout(QUERY_TIMEOUT, frame.collect())
+            .await
+            .context("query timed out")??;
+        let mut writer = ArrayWriter::new(Vec::new());
+        for b in &batches {
+            writer.write(b)?;
+        }
+        writer.finish()?;
+        let moved = stats.rewrites.load(Ordering::Relaxed) > 0;
+        Ok(QueryOutput {
+            json: writer.into_inner(),
+            rollup_seconds: moved.then(|| stats.last_seconds.load(Ordering::Relaxed)),
+        })
     }
 }
 

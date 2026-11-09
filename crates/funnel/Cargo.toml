@@ -10,6 +10,7 @@ anyhow = "1.0.104"
 axum = "0.8.9"
 clap = { version = "4.6.7", features = ["derive", "env"] }
 crossbeam-channel = "0.5.17"
+funnel-lake = { path = "../lake", optional = true }
 funnel-sketch = { path = "../sketch" }
 pprof = { version = "0.15.0", features = ["flamegraph"], optional = true }
 serde = { version = "1.0.229", features = ["derive"] }
@@ -28,11 +29,14 @@ bytes = "1.12.1"
 loadgen = { path = "../loadgen" }
 parquet = { version = "60", default-features = false, features = ["arrow", "zstd"] }
 proptest = "1.12"
+tempfile = "3"
 zstd = "0.13"
 
 [features]
 # Sampling CPU profiler behind `--profile`; needs no root or perf.
 profile = ["dep:pprof"]
+# Publish rollups to Iceberg and serve `POST /sql` with DataFusion.
+lake = ["dep:funnel-lake"]
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2.191"

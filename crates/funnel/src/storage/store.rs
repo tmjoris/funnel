@@ -215,6 +215,10 @@ impl Store {
         Ok(bytes)
     }
 
+    pub fn tenants(&self) -> Vec<String> {
+        self.tenants.lock().unwrap().keys().cloned().collect()
+    }
+
     /// Live files of `tenant` that may hold buckets in `[from, to]`.
     pub fn files(&self, tenant: &str, from: u64, to: u64) -> Vec<FileMeta> {
         let tenants = self.tenants.lock().unwrap();

@@ -1,6 +1,8 @@
 pub mod aggregator;
 pub mod hll;
 pub mod http;
+#[cfg(feature = "lake")]
+pub mod lake;
 pub mod limiter;
 pub mod protocol;
 pub mod query;

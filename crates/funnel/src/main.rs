@@ -60,6 +60,10 @@ struct Args {
     /// Delete data older than this many days; keep everything if unset.
     #[arg(long, env = "FUNNEL_RETENTION_DAYS")]
     retention_days: Option<u64>,
+    /// Also publish closed hours to Iceberg tables here and serve `POST /sql`.
+    #[cfg(feature = "lake")]
+    #[arg(long, env = "FUNNEL_LAKE_DIR")]
+    lake_dir: Option<std::path::PathBuf>,
     /// Sample CPU usage until shutdown and write a flamegraph here, plus a
     /// `.txt` list of the functions with the most self time. Needs the
     /// `profile` feature.
@@ -179,6 +183,20 @@ async fn main() -> anyhow::Result<()> {
                 }
             })?
     };
+    #[cfg(feature = "lake")]
+    let lake = match &args.lake_dir {
+        Some(dir) => Some(Arc::new(funnel_lake::Lake::open(dir).await?)),
+        None => None,
+    };
+    #[cfg(feature = "lake")]
+    let publisher = lake.clone().map(|lake| {
+        funnel::lake::spawn(
+            lake,
+            store.clone(),
+            tokio::runtime::Handle::current(),
+            stop.clone(),
+        )
+    });
     let (udp_addr, udp_threads) = udp::spawn(
         args.udp,
         args.udp_threads,
@@ -195,6 +213,8 @@ async fn main() -> anyhow::Result<()> {
         default_tenant: tenant,
         store: store.clone(),
         pending: pending.clone(),
+        #[cfg(feature = "lake")]
+        lake,
     });
     axum::serve(listener, app)
         .with_graceful_shutdown(async {
@@ -216,6 +236,10 @@ async fn main() -> anyhow::Result<()> {
     }
     let _ = writer.join();
     let _ = compactor.join();
+    #[cfg(feature = "lake")]
+    if let Some(publisher) = publisher {
+        let _ = publisher.join();
+    }
     tracing::info!(stats = ?stats.snapshot(), "stopped");
     #[cfg(feature = "profile")]
     if let (Some(path), Some(guard)) = (&args.profile, profiler) {

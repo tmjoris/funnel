@@ -29,15 +29,44 @@ pub struct AppState {
     pub default_tenant: Arc<str>,
     pub store: Arc<Store>,
     pub pending: Pending,
+    #[cfg(feature = "lake")]
+    pub lake: Option<Arc<funnel_lake::Lake>>,
 }
 
 pub fn app(state: AppState) -> Http {
-    Http::new()
+    let routes = Http::new()
         .route("/ingest", post(ingest))
         .route("/stats", get(stats))
         .route("/query", get(query_handler))
-        .route("/healthz", get(|| async { "ok" }))
-        .with_state(state)
+        .route("/healthz", get(|| async { "ok" }));
+    #[cfg(feature = "lake")]
+    let routes = routes.route("/sql", post(sql_handler));
+    routes.with_state(state)
+}
+
+/// `POST /sql` with one read-only statement as the body. The answer is a JSON array, and
+/// `x-funnel-rollup-seconds` names the rollup the planner chose, if it left the finest table.
+#[cfg(feature = "lake")]
+async fn sql_handler(State(state): State<AppState>, headers: HeaderMap, sql: String) -> Response {
+    let Some(tenant) = tenant_of(&state, &headers) else {
+        return (StatusCode::BAD_REQUEST, "invalid tenant").into_response();
+    };
+    let Some(lake) = state.lake.clone() else {
+        return (StatusCode::NOT_FOUND, "start funnel with --lake-dir").into_response();
+    };
+    match lake.query(&sql, &tenant).await {
+        Ok(out) => {
+            let mut response =
+                ([(header::CONTENT_TYPE, "application/json")], out.json).into_response();
+            if let Some(seconds) = out.rollup_seconds {
+                response
+                    .headers_mut()
+                    .insert("x-funnel-rollup-seconds", seconds.into());
+            }
+            response
+        }
+        Err(e) => (StatusCode::BAD_REQUEST, format!("{e:#}")).into_response(),
+    }
 }
 
 /// The tenant from the header, or the default; `None` if it is invalid.

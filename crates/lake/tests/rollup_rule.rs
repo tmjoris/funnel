@@ -172,8 +172,8 @@ async fn run(ctx: &SessionContext, sql: &str) -> Vec<Vec<String>> {
 async fn the_rule_never_changes_an_answer() {
     let dir = tempfile::tempdir().unwrap();
     let lake = lake(dir.path(), 1).await;
-    let (with_rule, stats) = lake.session(true).await.unwrap();
-    let (without_rule, _) = lake.session(false).await.unwrap();
+    let (with_rule, stats) = lake.session(true, None).await.unwrap();
+    let (without_rule, _) = lake.session(false, None).await.unwrap();
 
     let mut rng = StdRng::seed_from_u64(99);
     let mut nonempty = 0;
@@ -200,7 +200,7 @@ async fn the_rule_never_changes_an_answer() {
 async fn a_dashboard_query_reads_the_hourly_table() {
     let dir = tempfile::tempdir().unwrap();
     let lake = lake(dir.path(), 2).await;
-    let (ctx, stats) = lake.session(true).await.unwrap();
+    let (ctx, stats) = lake.session(true, None).await.unwrap();
     let sql = format!(
         "SELECT date_bin(INTERVAL '1 hour', ts) b, quantile(sketch, 0.5) FROM metrics \
          WHERE metric = 'lat' AND ts >= {} AND ts < {} GROUP BY 1 ORDER BY 1",
@@ -215,7 +215,7 @@ async fn a_dashboard_query_reads_the_hourly_table() {
 async fn queries_that_cannot_move_stay_on_the_fine_table() {
     let dir = tempfile::tempdir().unwrap();
     let lake = lake(dir.path(), 3).await;
-    let (ctx, stats) = lake.session(true).await.unwrap();
+    let (ctx, stats) = lake.session(true, None).await.unwrap();
     for sql in [
         "SELECT count(*) FROM metrics",
         "SELECT sum(sum) FROM metrics WHERE max > 100",
@@ -240,7 +240,7 @@ async fn publishing_the_same_hour_twice_adds_nothing() {
     lake.publish("acme", &rows, until).await.unwrap();
     lake.publish("acme", &rows, until).await.unwrap();
     assert_eq!(lake.watermark("acme").await.unwrap(), Some(until));
-    let (ctx, _) = lake.session(false).await.unwrap();
+    let (ctx, _) = lake.session(false, None).await.unwrap();
     let count = run(&ctx, "SELECT count(*) FROM metrics").await;
     assert_eq!(count[0][0], rows.len().to_string());
 }
@@ -254,4 +254,62 @@ async fn tenants_keep_separate_watermarks() {
     lake.publish("a", &a, EPOCH + HOUR).await.unwrap();
     assert_eq!(lake.watermark("a").await.unwrap(), Some(EPOCH + HOUR));
     assert_eq!(lake.watermark("b").await.unwrap(), None);
+}
+
+async fn two_tenants(dir: &std::path::Path) -> Lake {
+    let lake = Lake::open(dir).await.unwrap();
+    let mut rng = StdRng::seed_from_u64(6);
+    for tenant in ["a", "b"] {
+        let rows = hour_of_rows(&mut rng, tenant, 0);
+        lake.publish(tenant, &rows, EPOCH + HOUR).await.unwrap();
+    }
+    lake
+}
+
+async fn tenants_seen(lake: &Lake, sql: &str) -> String {
+    let out = lake.query(sql, "a").await.unwrap();
+    String::from_utf8(out.json).unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sql_only_sees_the_callers_tenant() {
+    let dir = tempfile::tempdir().unwrap();
+    let lake = two_tenants(dir.path()).await;
+    for sql in [
+        "SELECT DISTINCT tenant FROM metrics",
+        "SELECT DISTINCT tenant FROM metrics WHERE tenant = 'b' OR tenant = 'a'",
+        "SELECT DISTINCT tenant FROM (SELECT * FROM lake.funnel.metrics_1h) x",
+        "SELECT DISTINCT m.tenant FROM metrics m JOIN metrics_1m n ON m.tags = n.tags",
+    ] {
+        let json = tenants_seen(&lake, sql).await;
+        assert!(
+            json.contains("\"a\"") && !json.contains("\"b\""),
+            "{sql}: {json}"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sql_cannot_reach_metadata_tables_or_change_anything() {
+    let dir = tempfile::tempdir().unwrap();
+    let lake = two_tenants(dir.path()).await;
+    for sql in [
+        "SELECT * FROM \"metrics$snapshots\"",
+        "DROP TABLE metrics",
+        "INSERT INTO metrics SELECT * FROM metrics",
+        "SET datafusion.execution.batch_size = 1",
+    ] {
+        assert!(lake.query(sql, "a").await.is_err(), "allowed: {sql}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn tenant_scoped_queries_still_use_rollups() {
+    let dir = tempfile::tempdir().unwrap();
+    let lake = two_tenants(dir.path()).await;
+    let out = lake
+        .query("SELECT sum(sum) s FROM metrics WHERE metric = 'req'", "a")
+        .await
+        .unwrap();
+    assert_eq!(out.rollup_seconds, Some(3600));
 }
