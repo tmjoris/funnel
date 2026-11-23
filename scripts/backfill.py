@@ -14,6 +14,8 @@ parser.add_argument("--url", default="http://127.0.0.1:8080")
 parser.add_argument("--tenant", default="acme")
 parser.add_argument("--hours", type=int, default=3)
 parser.add_argument("--end", type=int, help="unix time the data ends at, on an hour boundary")
+parser.add_argument("--incident", action="store_true",
+                    help="make web-2 slow and backed up for 20 minutes, starting 80 minutes in")
 args = parser.parse_args()
 
 HOUR = 3600
@@ -22,6 +24,7 @@ now = int(time.time())
 end = args.end if args.end else (now - 900) // HOUR * HOUR
 start = end - args.hours * HOUR
 rng = random.Random(7)
+incident = range(start + 80 * 60, start + 100 * 60) if args.incident else range(0)
 
 
 def send(lines):
@@ -34,9 +37,13 @@ batch, total = [], 0
 for ts in range(start, end, 10):
     for host in ("web-1", "web-2", "web-3"):
         batch.append(f"http.requests:{rng.randint(50, 150)}|c|#host:{host}|T{ts}")
-        batch.append(f"queue.depth:{rng.randint(0, 40)}|g|#host:{host}|T{ts}")
+        bad = host == "web-2" and ts in incident
+        queue = rng.randint(150, 220) if bad else rng.randint(0, 40)
+        batch.append(f"queue.depth:{queue}|g|#host:{host}|T{ts}")
         for _ in range(5):
             slow = 30 if rng.random() < 0.02 else 1
+            if bad:
+                slow *= 8
             batch.append(f"http.duration:{rng.uniform(5, 40) * slow:.2f}|ms|#host:{host}|T{ts}")
     if len(batch) >= 2000:
         send(batch)
