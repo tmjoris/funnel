@@ -32,11 +32,13 @@ use iceberg::writer::file_writer::location_generator::{
 use iceberg::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
 use iceberg::writer::{IcebergWriter, IcebergWriterBuilder};
 use iceberg::{Catalog, CatalogBuilder, NamespaceIdent, TableCreation, TableIdent};
+use iceberg_catalog_rest::{REST_CATALOG_PROP_URI, REST_CATALOG_PROP_WAREHOUSE, RestCatalogBuilder};
 use iceberg_catalog_sql::{
     SQL_CATALOG_PROP_BIND_STYLE, SQL_CATALOG_PROP_URI, SQL_CATALOG_PROP_WAREHOUSE, SqlBindStyle,
     SqlCatalogBuilder,
 };
 use iceberg_datafusion::IcebergCatalogProvider;
+use iceberg_storage_opendal::OpenDalResolvingStorageFactory;
 use parquet::basic::{Compression, ZstdLevel};
 use parquet::file::properties::WriterProperties;
 use uuid::Uuid;
@@ -144,6 +146,36 @@ impl Lake {
                 .await
                 .context("opening the Iceberg catalog")?,
         );
+        Self::with_catalog(catalog).await
+    }
+
+    /// Opens the lake in an Iceberg REST catalog, such as Cloudflare's Basin Catalog on R2.
+    /// The catalog hands out short-lived storage credentials for each table, so the token
+    /// is the only secret needed; it is sent as a bearer token and never logged.
+    pub async fn open_rest(uri: &str, warehouse: &str, token: &str) -> Result<Lake> {
+        let props = HashMap::from([
+            (REST_CATALOG_PROP_URI.to_string(), uri.to_string()),
+            (REST_CATALOG_PROP_WAREHOUSE.to_string(), warehouse.to_string()),
+            ("token".to_string(), token.to_string()),
+            // A fixed token is sent as a bearer header by the oauth2 handler; say so explicitly.
+            ("rest.auth.type".to_string(), "oauth2".to_string()),
+            (
+                "header.X-Iceberg-Access-Delegation".to_string(),
+                "vended-credentials".to_string(),
+            ),
+        ]);
+        let catalog: Arc<dyn Catalog> = Arc::new(
+            RestCatalogBuilder::default()
+                .with_storage_factory(Arc::new(OpenDalResolvingStorageFactory::new()))
+                .load(CATALOG_NAME, props)
+                .await
+                .context("opening the Iceberg REST catalog")?,
+        );
+        Self::with_catalog(catalog).await
+    }
+
+    /// Creates the namespace and one table per resolution on first use.
+    async fn with_catalog(catalog: Arc<dyn Catalog>) -> Result<Lake> {
         let namespace = NamespaceIdent::new(NAMESPACE.into());
         if !catalog.namespace_exists(&namespace).await? {
             catalog.create_namespace(&namespace, HashMap::new()).await?;
