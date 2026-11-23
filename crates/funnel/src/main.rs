@@ -62,8 +62,20 @@ struct Args {
     retention_days: Option<u64>,
     /// Also publish closed hours to Iceberg tables here and serve `POST /sql`.
     #[cfg(feature = "lake")]
-    #[arg(long, env = "FUNNEL_LAKE_DIR")]
+    #[arg(long, env = "FUNNEL_LAKE_DIR", conflicts_with = "catalog_uri")]
     lake_dir: Option<std::path::PathBuf>,
+    /// Publish to an Iceberg REST catalog instead (for example Cloudflare Basin Catalog).
+    #[cfg(feature = "lake")]
+    #[arg(long, env = "FUNNEL_CATALOG_URI", requires_all = ["warehouse", "token_file"])]
+    catalog_uri: Option<String>,
+    /// Warehouse name in the REST catalog.
+    #[cfg(feature = "lake")]
+    #[arg(long, env = "FUNNEL_WAREHOUSE")]
+    warehouse: Option<String>,
+    /// File holding the catalog token as `BASIN_TOKEN=...` (kept out of argv and logs).
+    #[cfg(feature = "lake")]
+    #[arg(long, env = "FUNNEL_TOKEN_FILE")]
+    token_file: Option<std::path::PathBuf>,
     /// Sample CPU usage until shutdown and write a flamegraph here, plus a
     /// `.txt` list of the functions with the most self time. Needs the
     /// `profile` feature.
@@ -184,9 +196,20 @@ async fn main() -> anyhow::Result<()> {
             })?
     };
     #[cfg(feature = "lake")]
-    let lake = match &args.lake_dir {
-        Some(dir) => Some(Arc::new(funnel_lake::Lake::open(dir).await?)),
-        None => None,
+    let lake = match (&args.lake_dir, &args.catalog_uri) {
+        (Some(dir), _) => Some(Arc::new(funnel_lake::Lake::open(dir).await?)),
+        (None, Some(uri)) => {
+            let path = args.token_file.as_ref().expect("clap requires --token-file");
+            let text = std::fs::read_to_string(path)?;
+            let token = text
+                .lines()
+                .find_map(|l| l.trim().strip_prefix("BASIN_TOKEN="))
+                .filter(|t| !t.is_empty())
+                .ok_or_else(|| anyhow::anyhow!("no BASIN_TOKEN= line in {}", path.display()))?;
+            let warehouse = args.warehouse.as_deref().expect("clap requires --warehouse");
+            Some(Arc::new(funnel_lake::Lake::open_rest(uri, warehouse, token).await?))
+        }
+        (None, None) => None,
     };
     #[cfg(feature = "lake")]
     let publisher = lake.clone().map(|lake| {
