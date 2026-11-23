@@ -313,3 +313,24 @@ async fn tenant_scoped_queries_still_use_rollups() {
         .unwrap();
     assert_eq!(out.rollup_seconds, Some(3600));
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_tenant_behind_does_not_hold_back_another() {
+    let dir = tempfile::tempdir().unwrap();
+    let lake = Lake::open(dir.path()).await.unwrap();
+    let mut rng = StdRng::seed_from_u64(7);
+    for h in 0..3 {
+        let rows = hour_of_rows(&mut rng, "a", h);
+        lake.publish("a", &rows, EPOCH + (h + 1) * HOUR).await.unwrap();
+    }
+    let rows = hour_of_rows(&mut rng, "b", 0);
+    lake.publish("b", &rows, EPOCH + HOUR).await.unwrap();
+    let sql = format!(
+        "SELECT date_bin(INTERVAL '1 hour', ts) b, sum(sum) FROM metrics \
+         WHERE metric = 'req' AND ts >= {} AND ts < {} GROUP BY 1 ORDER BY 1",
+        stamp(0),
+        stamp(3 * HOUR)
+    );
+    let out = lake.query(&sql, "a").await.unwrap();
+    assert_eq!(out.rollup_seconds, Some(3600));
+}

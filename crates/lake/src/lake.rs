@@ -305,7 +305,12 @@ impl Lake {
             );
             tables.push(Rollup {
                 seconds: r.seconds,
-                covered_until: marks.values().copied().min(),
+                // A tenant-scoped session only reads that tenant's rows, so only its own
+                // progress matters; another tenant far behind must not hold it back.
+                covered_until: match tenant {
+                    Some(t) => marks.get(t).copied(),
+                    None => marks.values().copied().min(),
+                },
                 source,
             });
         }
