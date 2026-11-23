@@ -48,9 +48,7 @@ backend of 7,000 series each summary replaced 41 raw numbers.
 Customers say checkout felt slow around 4 pm. Wanjiru asks for the 95th percentile of request time
 on each server, in 10-minute steps. That's the time 95% of requests finished within.
 
-![p95 latency per server: web-2 jumps to 315 ms at 16:20 and 303 ms at 16:30](docs/images/03-latency.png)
-
-web-1 and web-3 stay at about 39 ms all afternoon. web-2 jumps to 315 ms at 16:20 and 303 ms at
+The answer is the table at the top of this page. web-1 and web-3 stay at about 39 ms all afternoon. web-2 jumps to 315 ms at 16:20 and 303 ms at
 16:30, then recovers. The `!` marks values far above the rest, and the bars at the bottom put all
 three servers on one scale, so the spike is visible at a glance. Funnel answered from 3,240
 summaries in 22 ms.
