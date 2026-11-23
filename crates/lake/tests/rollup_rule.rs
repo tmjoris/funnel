@@ -321,7 +321,9 @@ async fn a_tenant_behind_does_not_hold_back_another() {
     let mut rng = StdRng::seed_from_u64(7);
     for h in 0..3 {
         let rows = hour_of_rows(&mut rng, "a", h);
-        lake.publish("a", &rows, EPOCH + (h + 1) * HOUR).await.unwrap();
+        lake.publish("a", &rows, EPOCH + (h + 1) * HOUR)
+            .await
+            .unwrap();
     }
     let rows = hour_of_rows(&mut rng, "b", 0);
     lake.publish("b", &rows, EPOCH + HOUR).await.unwrap();
