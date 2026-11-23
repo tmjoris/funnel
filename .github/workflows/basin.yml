@@ -1,0 +1,62 @@
+name: Basin benchmark
+
+# Publishes the simulated fleet to Cloudflare Basin Catalog, then times dashboards read back
+# through Funnel and through Basin SQL. Started by hand only, since it writes to a real bucket.
+on:
+  workflow_dispatch:
+    inputs:
+      days:
+        description: Days of 10-second data
+        default: "7"
+      hosts:
+        description: Simulated hosts (three series each)
+        default: "200"
+      runs:
+        description: Runs per query (median reported)
+        default: "3"
+
+env:
+  CARGO_TERM_COLOR: never
+
+jobs:
+  basin:
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    env:
+      BASIN_TOKEN: ${{ secrets.BASIN_TOKEN }}
+      CF_ACCOUNT_ID: ${{ vars.CF_ACCOUNT_ID }}
+      BASIN_BUCKET: ${{ vars.BASIN_BUCKET }}
+      FUNNEL_CATALOG_URI: https://catalog.cloudflarestorage.com/${{ vars.CF_ACCOUNT_ID }}/${{ vars.BASIN_BUCKET }}
+      FUNNEL_WAREHOUSE: ${{ vars.CF_ACCOUNT_ID }}_${{ vars.BASIN_BUCKET }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check settings
+        run: |
+          [ -n "$BASIN_TOKEN" ] || { echo "Add the BASIN_TOKEN repository secret"; exit 1; }
+          [ -n "$CF_ACCOUNT_ID" ] && [ -n "$BASIN_BUCKET" ] || { echo "Set the CF_ACCOUNT_ID and BASIN_BUCKET repository variables"; exit 1; }
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --release -p funnel-lake --example basin
+      - name: Publish and query through Funnel
+        run: |
+          cargo run --release -p funnel-lake --example basin -- \
+            "${{ inputs.days }}" "${{ inputs.hosts }}" "${{ inputs.runs }}" | tee funnel.txt
+          { echo "## Funnel reading from R2 (${{ inputs.days }} days, ${{ inputs.hosts }} hosts)"; grep '^|' funnel.txt; } >> "$GITHUB_STEP_SUMMARY"
+      - name: Query through Basin SQL
+        run: |
+          python3 scripts/basin_sql_bench.py --days "${{ inputs.days }}" --runs "${{ inputs.runs }}" | tee basin-sql.txt
+          { echo "## Basin SQL, raw table vs rollup"; cat basin-sql.txt; } >> "$GITHUB_STEP_SUMMARY"
+      - name: Machine
+        if: always()
+        run: |
+          { lscpu | grep -E 'Model name|^CPU\(s\)'; free -h | head -2; rustc --version; } | tee machine.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: basin-bench
+          path: |
+            funnel.txt
+            basin-sql.txt
+            basin-sql.json
+            machine.txt
