@@ -121,6 +121,24 @@ with 7 days of data from 200 servers (36.3 million rows):
 The test suite runs 200 generated queries with this rule on and off and requires identical
 answers.
 
+The same data on Cloudflare: a GitHub Actions run published those 7 days (36.3 million rows) to
+an R2 bucket through Basin Catalog in 75 minutes, then ran each dashboard in Basin SQL twice,
+once on the 10-second table and once on the matching rollup. Basin SQL bills by data scanned.
+
+| Dashboard in Basin SQL | 10-second table | Rollup | Less data |
+|---|---|---|---|
+| request total per hour, 7 days | 30.1 MB | 1.97 MB (1 hour) | 15x |
+| peak queue per server, 7 days | 13.0 MB | 1.80 MB (1 hour) | 7x |
+| request total per 10 minutes, 1 day | 5.0 MB | 1.30 MB (10 minutes) | 4x |
+| request total per minute, 1 hour | 1.0 MB | 0.97 MB (1 minute) | 1x |
+
+Every pair returned identical answers. The rollups did not make Basin SQL faster, though: both
+versions took 2 to 4 seconds, because each opens the same 521 small files, one per table for every
+hour published. Funnel reading the same R2 tables from the Actions runner shows the same limit: the
+7-day p99 chart went from 71.5 s to 22.6 s (3.2x), against 13.5 s to 0.43 s on local disk. Merging
+those hourly files into larger ones is the next step. [`.github/workflows/basin.yml`](.github/workflows/basin.yml)
+runs this benchmark.
+
 ## Run it yourself
 
 You need Rust, Python 3 and `curl`. The first build compiles Apache DataFusion and takes about an
