@@ -20,7 +20,6 @@ import urllib.parse
 import urllib.request
 
 COLOR = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
-BARS = "▁▂▃▄▅▆▇█"
 
 
 def paint(code, text):
@@ -40,7 +39,7 @@ def green(t):
 
 
 def yellow(t):
-    return paint("33", t)
+    return paint("1;93", t)
 
 
 def request(args, path, body=None):
@@ -99,12 +98,6 @@ def table(header, rows, right=None):
         print(line(r))
 
 
-def spark(values, high):
-    """One bar per row, all series on the same scale from zero, so a spike stands out."""
-    high = high or 1
-    return "".join(" " if v is None else BARS[round(max(v, 0) / high * (len(BARS) - 1))] for v in values)
-
-
 def cmd_query(args):
     params = {"metric": args.metric, "agg": args.agg, "step": args.step}
     if args.by:
@@ -138,11 +131,20 @@ def cmd_query(args):
             row.append(yellow(text + " !") if c is not None and c > 3 * typical else text + "  ")
         rows.append(row)
     table(["time", *names], rows, right=set(range(1, len(names) + 1)))
-    print()
-    width = max(len(n) for n in names)
-    for n, v in zip(names, values):
-        print(f"{n.ljust(width)}  {spark([v.get(t) for t in times], max(everything))}")
-    print(dim(f"\n{data['buckets_read']:,} buckets read from {data['files_read']} files in {ms:.0f} ms"))
+    print(dim(f"\n{data['buckets_read']:,} summaries read from {data['files_read']} files in {ms:.0f} ms"))
+
+
+STAMP = re.compile(r"^(\d{4}-\d\d-\d\d)T(\d\d:\d\d):\d\d")
+
+
+def short_times(rows):
+    """Shows timestamps as HH:MM when they all fall on one day, and returns that day."""
+    days = {m.group(1) for r in rows for v in r.values() if isinstance(v, str) and (m := STAMP.match(v))}
+    if len(days) != 1:
+        return rows, None
+    out = [{k: (STAMP.match(v).group(2) if isinstance(v, str) and STAMP.match(v) else v)
+            for k, v in r.items()} for r in rows]
+    return out, days.pop()
 
 
 TABLE_NAMES = {10: "10-second", 60: "1-minute", 600: "10-minute", 3600: "1-hour"}
@@ -151,7 +153,9 @@ TABLE_NAMES = {10: "10-second", 60: "1-minute", 600: "10-minute", 3600: "1-hour"
 def cmd_sql(args):
     sql = " ".join(args.sql)
     body, headers, ms = request(args, "/sql", sql)
-    rows = json.loads(body)
+    rows, day = short_times(json.loads(body))
+    if day:
+        print(dim(f"times are UTC on {day}"))
     if rows:
         header = list(rows[0].keys())
         numeric = {i for i, h in enumerate(header) if isinstance(rows[0][h], (int, float))}
