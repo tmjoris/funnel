@@ -32,7 +32,9 @@ use iceberg::writer::file_writer::location_generator::{
 use iceberg::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
 use iceberg::writer::{IcebergWriter, IcebergWriterBuilder};
 use iceberg::{Catalog, CatalogBuilder, NamespaceIdent, TableCreation, TableIdent};
-use iceberg_catalog_rest::{REST_CATALOG_PROP_URI, REST_CATALOG_PROP_WAREHOUSE, RestCatalogBuilder};
+use iceberg_catalog_rest::{
+    REST_CATALOG_PROP_URI, REST_CATALOG_PROP_WAREHOUSE, RestCatalogBuilder,
+};
 use iceberg_catalog_sql::{
     SQL_CATALOG_PROP_BIND_STYLE, SQL_CATALOG_PROP_URI, SQL_CATALOG_PROP_WAREHOUSE, SqlBindStyle,
     SqlCatalogBuilder,
@@ -155,7 +157,10 @@ impl Lake {
     pub async fn open_rest(uri: &str, warehouse: &str, token: &str) -> Result<Lake> {
         let props = HashMap::from([
             (REST_CATALOG_PROP_URI.to_string(), uri.to_string()),
-            (REST_CATALOG_PROP_WAREHOUSE.to_string(), warehouse.to_string()),
+            (
+                REST_CATALOG_PROP_WAREHOUSE.to_string(),
+                warehouse.to_string(),
+            ),
             ("token".to_string(), token.to_string()),
             // A fixed token is sent as a bearer header by the oauth2 handler; say so explicitly.
             ("rest.auth.type".to_string(), "oauth2".to_string()),

@@ -199,15 +199,23 @@ async fn main() -> anyhow::Result<()> {
     let lake = match (&args.lake_dir, &args.catalog_uri) {
         (Some(dir), _) => Some(Arc::new(funnel_lake::Lake::open(dir).await?)),
         (None, Some(uri)) => {
-            let path = args.token_file.as_ref().expect("clap requires --token-file");
+            let path = args
+                .token_file
+                .as_ref()
+                .expect("clap requires --token-file");
             let text = std::fs::read_to_string(path)?;
             let token = text
                 .lines()
                 .find_map(|l| l.trim().strip_prefix("BASIN_TOKEN="))
                 .filter(|t| !t.is_empty())
                 .ok_or_else(|| anyhow::anyhow!("no BASIN_TOKEN= line in {}", path.display()))?;
-            let warehouse = args.warehouse.as_deref().expect("clap requires --warehouse");
-            Some(Arc::new(funnel_lake::Lake::open_rest(uri, warehouse, token).await?))
+            let warehouse = args
+                .warehouse
+                .as_deref()
+                .expect("clap requires --warehouse");
+            Some(Arc::new(
+                funnel_lake::Lake::open_rest(uri, warehouse, token).await?,
+            ))
         }
         (None, None) => None,
     };
