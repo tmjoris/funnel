@@ -105,7 +105,7 @@ def main():
 
     results = []
     for name, rollup, template in dashboards(args.days):
-        entry = {"dashboard": name, "rollup": rollup}
+        entry = {"dashboard": name, "rollup_table": rollup}
         answers = {}
         for side, table in (("raw", "metrics"), ("rollup", rollup)):
             sql = template.format(table=table)
@@ -132,7 +132,7 @@ def main():
     print("|---|---|---|---|---|---|---|---|---|---|")
     for e in results:
         raw, roll = e["raw"], e["rollup"]
-        print(f"| {e['dashboard']} | {e['rollup']} "
+        print(f"| {e['dashboard']} | {e['rollup_table']} "
               f"| {raw['bytes_scanned'] / 1e6:.1f} | {roll['bytes_scanned'] / 1e6:.2f} "
               f"| {raw['bytes_scanned'] / max(roll['bytes_scanned'], 1):.0f}x "
               f"| {raw['median_ms']} | {roll['median_ms']} "
