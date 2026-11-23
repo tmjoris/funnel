@@ -6,7 +6,7 @@ number, which makes it cheap enough to run on a $6 server, and it can save the h
 [Apache Iceberg](https://iceberg.apache.org/) tables on your own disk or in a Cloudflare R2
 bucket, where any SQL engine can read it.
 
-![p95 latency per server, every 10 minutes, with web-2 flagged at 315 ms](docs/images/03-latency.png)
+![Funnel's stats, then p95 latency per server every 10 minutes, with web-2 flagged at 315 ms](docs/images/03-latency.png)
 
 That table is Funnel telling you one of three servers got slow for twenty minutes. The rest of
 this page follows that afternoon from start to finish. Every screenshot is a real run on a laptop.
@@ -37,8 +37,8 @@ three hours of traffic from all three servers, including the slow patch on web-2
 
 ![Sending one metric by hand, then three hours of history](docs/images/02-send.png)
 
-Funnel received 22,681 lines and kept them as 9,721 summaries, one per server per metric per 10
-seconds. Each summary holds enough to answer the usual questions later: the total, the minimum and
+Funnel received 22,681 lines and kept them as 9,721 summaries (the stats at the top of the first
+screenshot), one per server per metric per 10 seconds. Each summary holds enough to answer the usual questions later: the total, the minimum and
 maximum, and a small [sketch](crates/sketch) of about 1 KB that gives any percentile to within 1%.
 This demo sends only a few numbers per 10 seconds. Real traffic sends far more, and on a simulated
 backend of 7,000 series each summary replaced 41 raw numbers.
@@ -49,9 +49,8 @@ Customers say checkout felt slow around 4 pm. Wanjiru asks for the 95th percenti
 on each server, in 10-minute steps. That's the time 95% of requests finished within.
 
 The answer is the table at the top of this page. web-1 and web-3 stay at about 39 ms all afternoon. web-2 jumps to 315 ms at 16:20 and 303 ms at
-16:30, then recovers. The `!` marks values far above the rest, and the bars at the bottom put all
-three servers on one scale, so the spike is visible at a glance. Funnel answered from 3,240
-summaries in 22 ms.
+16:30, then recovers. The `!` marks values far above the rest. Funnel answered from 3,240
+summaries in 20 ms.
 
 ### 4. Was web-2 backed up?
 
@@ -75,8 +74,8 @@ also keeps copies summed to 1 minute, 10 minutes and 1 hour, and its query plann
 query to the 1-hour table because that gives exactly the same answer from far fewer rows. On a
 week of data from 200 servers, that made the same kind of query 31 times faster.
 
-This query took 12 seconds, nearly all of it spent talking to Cloudflare's catalog and storage from
-the laptop. With the tables on local disk, a 7-day query takes under half a second.
+This query took about 17 seconds, nearly all of it spent talking to Cloudflare's catalog and
+storage from the laptop. With the tables on local disk, a 7-day query takes under half a second.
 
 ### 6. The same data, read by Cloudflare
 
@@ -86,8 +85,7 @@ per server.
 
 ![Funnel and Basin SQL return the same request totals per server](docs/images/06-basin.png)
 
-Both return 106,572, 106,975 and 108,369. Basin SQL read only 45.9 kB from R2, since the query
-names the hourly table. Basin SQL can't read the latency sketches, which are Funnel's own
+Both return 106,573, 106,975 and 108,369. Basin SQL read 258 kB from R2 to answer. Basin SQL can't read the latency sketches, which are Funnel's own
 binary format, so percentiles still come from Funnel. Counts, sums, minimums and maximums work in
 both.
 
@@ -137,14 +135,14 @@ To follow the story above on your own machine:
 
 ```sh
 ./target/release/funnel --data-dir data --lake-dir lake        # local disk only
-python3 scripts/backfill.py --tenant duka --incident           # in another terminal
+python3 scripts/backfill.py --tenant duka --incident --end $(date -ud 18:00 +%s)   # in another terminal
 export FUNNEL_TENANT=duka
 scripts/funnel.py query http.duration --agg p95 --by host --step 600 --from 15:00 --to 18:00
 scripts/funnel.py sql "SELECT tags, max(max) AS peak FROM metrics WHERE metric = 'queue.depth' GROUP BY 1"
 ```
 
-`backfill.py` writes the three most recent finished hours, so adjust `--from` and `--to` to the
-times it prints. Hours reach SQL about a minute after they are sent.
+`--end` is when the three hours of data stop, so it has to be in the past; adjust `--from` and
+`--to` to match. Hours reach SQL about a minute after they are sent.
 
 To publish to Cloudflare instead of a local directory, create an R2 bucket, turn on Basin Catalog
 for it in the R2 dashboard, and give Funnel the catalog address:
