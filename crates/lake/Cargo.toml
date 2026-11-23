@@ -11,8 +11,12 @@ async-trait = "0.1.89"
 datafusion = "54"
 funnel-sketch = { path = "../sketch" }
 iceberg = "0.11"
+iceberg-catalog-rest = "0.11"
 iceberg-catalog-sql = "0.11"
 iceberg-datafusion = "0.11"
+iceberg-storage-opendal = "0.11"
+# iceberg-catalog-rest pulls reqwest 0.12 without TLS; enabling rustls here gives it HTTPS.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 parquet = "58.4"
 serde_json = "1.0.154"
 sqlx = { version = "0.8.1", default-features = false, features = ["runtime-tokio", "sqlite", "any"] }
