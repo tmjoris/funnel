@@ -249,6 +249,27 @@ Velox (Gluten 1.7.0). All three matched DataFusion exactly on two aggregate quer
 of data, one of them answered by DataFusion from the hourly rollup. [`interop/`](interop) has
 that check.
 
+### Publishing to Cloudflare Basin Catalog
+
+Funnel can also publish to an Iceberg REST catalog instead of a local directory. With Cloudflare's
+[Basin Catalog](https://developers.cloudflare.com/basin-catalog/), the tables live in an R2 bucket
+and Cloudflare's own engine, [Basin SQL](https://developers.cloudflare.com/basin-sql/), can query
+them next to Funnel.
+
+```sh
+funnel --catalog-uri https://catalog.cloudflarestorage.com/<account-id>/<bucket> \
+       --warehouse <account-id>_<bucket> \
+       --token-file ~/.config/funnel/basin.env     # one line: BASIN_TOKEN=<R2 API token>
+```
+
+The token needs R2 "Admin Read & Write" so Funnel can create tables and commit data; the catalog
+hands out short-lived storage credentials for each table, so no separate S3 keys are needed. It is
+read from a file to keep it out of the process list and logs.
+
+In a first run, three hours of demo metrics reached the catalog 161 seconds after Funnel received
+them. Funnel's planner answered a per-hour p99 query from `metrics_1h` in R2, and Basin SQL read the
+same table and returned exactly the same totals for every metric.
+
 Each SQL session is limited to the caller's tenant by a rule that filters every table scan, so a
 query cannot read another tenant's rows by leaving out a filter. Only read-only statements run, each
 with a 1 GB memory limit and a 30-second timeout.
