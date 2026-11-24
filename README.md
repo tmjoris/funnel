@@ -135,9 +135,22 @@ once on the 10-second table and once on the matching rollup. Basin SQL bills by 
 Every pair returned identical answers. The rollups did not make Basin SQL faster, though: both
 versions took 2 to 4 seconds, because each opens the same 521 small files, one per table for every
 hour published. Funnel reading the same R2 tables from the Actions runner shows the same limit: the
-7-day p99 chart went from 71.5 s to 22.6 s (3.2x), against 13.5 s to 0.43 s on local disk. Merging
-those hourly files into larger ones is the next step. [`.github/workflows/basin.yml`](.github/workflows/basin.yml)
-runs this benchmark.
+7-day p99 chart went from 71.5 s to 22.6 s (3.2x), against 13.5 s to 0.43 s on local disk.
+[`.github/workflows/basin.yml`](.github/workflows/basin.yml) runs this benchmark.
+
+Turning on Basin Catalog's automatic compaction then merged each table's 175 files into one to
+seven. The rollups got cheaper again: the 7-day dashboard read 0.46 MB instead of 1.97 MB, about
+240 times less than the same query on the 10-second table. Queries on the 10-second table got
+worse, reading 111 MB instead of 30 MB for the same answer, most likely because the merged files no
+longer keep the row order Funnel writes, which is what let Basin SQL skip most of each file.
+Funnel's tables don't declare an Iceberg sort order yet, so compaction has none to keep; declaring
+one is the next thing to try. (These runs were made from a laptop; bytes scanned don't depend on
+where a query runs from.)
+
+Compaction also exposed a bug. Funnel recorded how far each tenant had been published in the
+newest snapshot's summary, and compaction's snapshots don't carry it, so the next run published the
+whole week a second time. Funnel now reads the newest snapshot that has its record, and a test
+covers another writer committing on top of Funnel.
 
 ## Run it yourself
 
