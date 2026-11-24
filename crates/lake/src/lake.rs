@@ -203,13 +203,22 @@ impl Lake {
         Ok(self.catalog.load_table(&ident).await?)
     }
 
+    /// The watermarks Funnel last committed. Maintenance by other writers, such as a catalog's
+    /// compaction, adds snapshots without them, so this walks back to the newest snapshot that has
+    /// them. Reading only the current snapshot made Funnel forget its progress after compaction
+    /// and publish every hour a second time.
     fn watermarks(table: &Table) -> BTreeMap<String, i64> {
-        table
-            .metadata()
-            .current_snapshot()
-            .and_then(|s| s.summary().additional_properties.get(WATERMARKS).cloned())
-            .and_then(|json| serde_json::from_str(&json).ok())
-            .unwrap_or_default()
+        let metadata = table.metadata();
+        let mut snapshot = metadata.current_snapshot();
+        while let Some(s) = snapshot {
+            if let Some(json) = s.summary().additional_properties.get(WATERMARKS) {
+                return serde_json::from_str(json).unwrap_or_default();
+            }
+            snapshot = s
+                .parent_snapshot_id()
+                .and_then(|id| metadata.snapshot_by_id(id));
+        }
+        BTreeMap::new()
     }
 
     /// The newest moment `tenant` is published up to, at every resolution.
@@ -405,4 +414,45 @@ fn batch(schema: &SchemaRef, rows: &[Row]) -> Result<RecordBatch> {
         Arc::new(sketch.finish()),
     ];
     Ok(RecordBatch::try_new(schema.clone(), columns)?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn row(ts: i64) -> Row {
+        Row {
+            tenant: "a".into(),
+            metric: "req".into(),
+            tags: "host=h1".into(),
+            kind: "counter",
+            ts,
+            count: 0.0,
+            sum: 1.0,
+            min: None,
+            max: None,
+            last: None,
+            last_at: None,
+            sketch: None,
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn another_writers_snapshot_keeps_the_watermark() {
+        let dir = tempfile::tempdir().unwrap();
+        let lake = Lake::open(dir.path()).await.unwrap();
+        lake.publish("a", &[row(0)], 3600).await.unwrap();
+
+        // Another writer, like Basin Catalog's compaction, commits a snapshot without Funnel's
+        // watermarks on top of every table.
+        for r in RESOLUTIONS {
+            let table = lake.table(r.table).await.unwrap();
+            let files = Lake::write_rows(&table, &[row(10)]).await.unwrap();
+            let tx = Transaction::new(&table);
+            let tx = tx.fast_append().add_data_files(files).apply(tx).unwrap();
+            tx.commit(lake.catalog.as_ref()).await.unwrap();
+        }
+
+        assert_eq!(lake.watermark("a").await.unwrap(), Some(3600));
+    }
 }
