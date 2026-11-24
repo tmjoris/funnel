@@ -14,6 +14,9 @@ on:
       runs:
         description: Runs per query (median reported)
         default: "3"
+      tenant:
+        description: Tenant to publish and query
+        default: "bench"
 
 env:
   CARGO_TERM_COLOR: never
@@ -28,6 +31,7 @@ jobs:
       BASIN_BUCKET: ${{ vars.BASIN_BUCKET }}
       FUNNEL_CATALOG_URI: https://catalog.cloudflarestorage.com/${{ vars.CF_ACCOUNT_ID }}/${{ vars.BASIN_BUCKET }}
       FUNNEL_WAREHOUSE: ${{ vars.CF_ACCOUNT_ID }}_${{ vars.BASIN_BUCKET }}
+      FUNNEL_BENCH_TENANT: ${{ inputs.tenant }}
     steps:
       - uses: actions/checkout@v4
       - name: Check settings
@@ -45,7 +49,7 @@ jobs:
           { echo "## Funnel reading from R2 (${{ inputs.days }} days, ${{ inputs.hosts }} hosts)"; grep '^|' funnel.txt; } >> "$GITHUB_STEP_SUMMARY"
       - name: Query through Basin SQL
         run: |
-          python3 scripts/basin_sql_bench.py --days "${{ inputs.days }}" --runs "${{ inputs.runs }}" | tee basin-sql.txt
+          python3 scripts/basin_sql_bench.py --days "${{ inputs.days }}" --runs "${{ inputs.runs }}" --tenant "${{ inputs.tenant }}" | tee basin-sql.txt
           { echo "## Basin SQL, raw table vs rollup"; cat basin-sql.txt; } >> "$GITHUB_STEP_SUMMARY"
       - name: Machine
         if: always()
