@@ -3,7 +3,7 @@
 
 Basin SQL bills by bytes scanned, so for each dashboard this records the bytes and files it read
 from the 10-second table and from the coarsest rollup that gives the same answer, the median
-time over several runs, and whether both answers match. Uses the `bench` tenant written by
+time over several runs, and whether both answers match. Uses the `bench` tenant (or --tenant) written by
 `cargo run --release -p funnel-lake --example basin`.
 
     BASIN_TOKEN=... CF_ACCOUNT_ID=... BASIN_BUCKET=... scripts/basin_sql_bench.py --days 7
@@ -18,7 +18,6 @@ import urllib.error
 import urllib.request
 
 EPOCH = dt.datetime(2026, 1, 1)
-TENANT = "bench"
 # https://developers.cloudflare.com/basin-sql/platform/pricing/
 PRICE_PER_TB = 2.50
 MIN_BYTES = 10_000_000
@@ -28,11 +27,11 @@ def stamp(hours):
     return "TIMESTAMP '" + (EPOCH + dt.timedelta(hours=hours)).strftime("%Y-%m-%dT%H:%M:%S") + "'"
 
 
-def dashboards(days):
+def dashboards(days, tenant):
     end = days * 24
 
     def where(metric, start):
-        return (f"tenant = '{TENANT}' AND metric = '{metric}' "
+        return (f"tenant = '{tenant}' AND metric = '{metric}' "
                 f"AND ts >= {stamp(start)} AND ts < {stamp(end)}")
 
     return [
@@ -97,6 +96,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--days", type=int, default=7)
     ap.add_argument("--runs", type=int, default=3)
+    ap.add_argument("--tenant", default="bench")
     ap.add_argument("--json", default="basin-sql.json")
     args = ap.parse_args()
     api = ("https://api.sql.cloudflarestorage.com/api/v1/accounts/"
@@ -104,7 +104,7 @@ def main():
     token = os.environ["BASIN_TOKEN"]
 
     results = []
-    for name, rollup, template in dashboards(args.days):
+    for name, rollup, template in dashboards(args.days, args.tenant):
         entry = {"dashboard": name, "rollup_table": rollup}
         answers = {}
         for side, table in (("raw", "metrics"), ("rollup", rollup)):
