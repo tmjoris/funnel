@@ -4,7 +4,8 @@
 //! FUNNEL_CATALOG_URI=... FUNNEL_WAREHOUSE=... BASIN_TOKEN=... \
 //!   cargo run --release -p funnel-lake --example basin -- [DAYS] [HOSTS] [RUNS]
 //!
-//! Rows go to the `bench` tenant. Hours already published are skipped, so a cut-short run resumes.
+//! Rows go to the `bench` tenant, or to FUNNEL_BENCH_TENANT if set. Hours already published are
+//! skipped, so a cut-short run resumes.
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 
@@ -15,8 +16,6 @@ use rand::rngs::StdRng;
 
 mod fleet;
 use fleet::{EPOCH, HOUR, dashboards, hour};
-
-const TENANT: &str = "bench";
 
 async fn timed(ctx: &SessionContext, sql: &str) -> anyhow::Result<(f64, usize)> {
     let start = Instant::now();
@@ -40,6 +39,7 @@ async fn main() -> anyhow::Result<()> {
     let days: i64 = args.get(1).map_or(7, |v| v.parse().unwrap());
     let hosts: usize = args.get(2).map_or(200, |v| v.parse().unwrap());
     let runs: usize = args.get(3).map_or(3, |v| v.parse().unwrap());
+    let tenant = std::env::var("FUNNEL_BENCH_TENANT").unwrap_or_else(|_| "bench".into());
 
     let lake = Lake::open_rest(
         &env("FUNNEL_CATALOG_URI")?,
@@ -49,7 +49,7 @@ async fn main() -> anyhow::Result<()> {
     .await?;
 
     // The generator is seeded, so every hour is drawn in order even when it is skipped.
-    let done = lake.watermark(TENANT).await?.unwrap_or(EPOCH);
+    let done = lake.watermark(&tenant).await?.unwrap_or(EPOCH);
     let mut rng = StdRng::seed_from_u64(42);
     let started = Instant::now();
     let (mut points, mut published) = (0usize, 0);
@@ -60,10 +60,10 @@ async fn main() -> anyhow::Result<()> {
             continue;
         }
         for row in &mut rows {
-            row.tenant = TENANT.into();
+            row.tenant = tenant.clone();
         }
         points += rows.len();
-        lake.publish(TENANT, &rows, until).await?;
+        lake.publish(&tenant, &rows, until).await?;
         published += 1;
         if published % 24 == 0 {
             println!(
@@ -77,8 +77,8 @@ async fn main() -> anyhow::Result<()> {
         started.elapsed().as_secs_f64()
     );
 
-    let (with_rule, stats) = lake.session(true, Some(TENANT)).await?;
-    let (without_rule, _) = lake.session(false, Some(TENANT)).await?;
+    let (with_rule, stats) = lake.session(true, Some(tenant.as_str())).await?;
+    let (without_rule, _) = lake.session(false, Some(tenant.as_str())).await?;
     println!("| dashboard | table chosen | without rule ms | with rule ms | speedup | rows |");
     println!("|---|---|---|---|---|---|");
     for (name, sql) in dashboards(days) {
